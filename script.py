@@ -56,94 +56,6 @@ def save_json(result, filename):
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
-
-def backtest_strategy(data):
-    # 1. 데이터 로드
-    data = get_historical_data(symbol, start_year)
-    # dates = data['dates']
-    # prices = data['close_prices']
-
-    print(f"📊 데이터 로드 완료: {len(data)}개 ({data[0]['date']} ~ {data[-1]['date']})")
-
-    # 2. 초기 설정
-    global initial_capital, cash, position, trades
-    # initial_capital = 1_000
-    # cash = initial_capital * 0.5  # 50% 현금
-    # position = (initial_capital * 0.5) / data[0]['close_price']  # 50% 도지코인
-    # trades = []
-
-    print(f"🚀 백테스트 시작: 원금 {initial_capital:,}$")
-    print(f"   초기 현금: {cash:,.0f}$, 초기 포지션: {position:.2f} DOGE")
-
-    # 3. 전략 적용 (1%당 1,000원)
-    for i in range(1, len(data)):
-        prev_price = data[i - 1]['close_price']
-        curr_price = data[i]['close_price']
-        pct_change = (curr_price - prev_price) / prev_price * 100
-
-        # 거래 금액 계산
-        trade_amount = abs(pct_change) * 1
-
-        if pct_change >= 1.0 and position > 0:
-            # 매도
-            sell_qty = min(position, trade_amount / curr_price)
-            if sell_qty > 0:
-                cash += sell_qty * curr_price
-                position -= sell_qty
-                trades.append({
-                    'date': data[i]['date'],
-                    'action': 'SELL',
-                    'qty': sell_qty,
-                    'price': curr_price,
-                    'amount': sell_qty * curr_price
-                })
-
-        elif pct_change <= -1.0 and cash >= trade_amount:
-            # 매수
-            buy_qty = trade_amount / curr_price
-            cash -= trade_amount
-            position += buy_qty
-            trades.append({
-                'date': data[i]['date'],
-                'action': 'BUY',
-                'qty': buy_qty,
-                'price': curr_price,
-                'amount': trade_amount
-            })
-
-    # 4. 최종 결과 계산
-    final_price = data[-1]['close_price']
-    final_value = cash + position * final_price
-    total_return = (final_value - initial_capital) / initial_capital * 100
-
-    # 5. 결과 출력
-    print("\n" + "=" * 60)
-    print("🎯 백테스트 결과")
-    print("=" * 60)
-    print(f"📈 최종 가치:      {final_value:,.0f} $")
-    print(f"💰 수익률:         {total_return:+.1f}%")
-    print(f"💼 최종 현금:      {cash:,.0f} $")
-    print(f"🐕 최종 도지 보유: {position:.2f} DOGE")
-    print(f"📊 거래 횟수:      {len(trades)}회")
-    print(f"💸 바이앤홀드:     {((final_price / data[0]['close_price'] - 1) * 100):+.1f}%")
-    print(f"💰🐕 시작 도지 가격:         {format_crypto_price(data[0]['close_price'])} $")
-    print(f"💰🐕 최종 도지 가격:         {format_crypto_price(data[-1]['close_price'])} $")
-
-    # 최근 거래 5건
-    print("\n📋 최근 거래:")
-    for trade in trades[-5:]:
-        print(f"  {trade['date']}: {trade['action']} {trade['qty']:.2f} @ ${trade['price']:.8f}")
-
-    return {
-        'initial_capital': initial_capital,
-        'final_value': final_value,
-        'return_pct': total_return,
-        'trades': trades,
-        'final_cash': cash,
-        'final_position': position
-    }
-
-
 initial_capital, cash, position, trades = 0, 0, 0, []
 
 
@@ -249,38 +161,6 @@ def backtest_strategy_improved(data):
         'final_cash': cash,
         'final_position': position
     }
-
-
-def monte_carlo_backtest(data, n_simulations=100):
-    results = []
-
-    for sim in range(n_simulations):
-        # 1. 데이터 샘플링 (순서 섞기)
-        indices = list(range(len(data)))
-        # random.shuffle(indices)
-        # sample_data = [data[i] for i in indices[:int(len(data) * 0.8)]]
-        sample_data = data
-
-        # 2. 랜덤 시작점
-        start_idx = random.randint(0, len(sample_data) - 100)
-        test_data = sample_data[start_idx:start_idx + 100]
-
-        # 3. 백테스트 실행
-        result = backtest_strategy_improved(data=test_data)
-        results.append(result['return_pct'])
-
-        print(f"시뮬레이션 {sim + 1}: {result['return_pct']:.1f}%")
-
-    # 통계 분석
-    avg_return = np.mean(results)
-    win_rate = np.mean([r > 0 for r in results])
-
-    print(f"\n📊 Monte Carlo 결과 (n={n_simulations})")
-    print(f"평균 수익률: {avg_return:.1f}%")
-    print(f"승률: {win_rate:.1%}")
-    print(f"최대 손실: {min(results):.1f}%")
-
-    return results
 
 
 if __name__ == '__main__':
