@@ -184,9 +184,9 @@ if __name__ == '__main__':
     trades = []
 
     # monte_carlo_backtest(data=data, n_simulations=10000)
-    for i in range(100):
+    for i in range(1):
         # backtest_strategy(data=data)
         backtest_strategy_improved(data=data)
-    # print("\n📋 최근 거래:")
-    # for trade in trades:
-    #     print(f"  {trade['date']}: {trade['action']} {trade['qty']:.8f} @ {trade['pct_change']:.2f}% @ ${trade['price']:.8f} | 최종가치: {trade['final_value']:,.2f}$ {trade['cash']:,.2f}$ {trade['position']:.2f}")
+    print("\n📋 최근 거래:")
+    for trade in trades:
+        print(f"  {trade['date']}: {trade['action']} {trade['qty']:.8f} @ {trade['pct_change']:.2f}% @ ${trade['price']:.8f} | 최종가치: {trade['final_value']:,.2f}$ {trade['cash']:,.2f}$ {trade['position']:.2f}")
