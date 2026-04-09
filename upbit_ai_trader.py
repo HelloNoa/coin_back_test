@@ -40,10 +40,12 @@ UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "YOUR_SECRET_KEY")
 TRADE_INTERVAL_SECONDS = 60 * 30   # 30분마다 판단
 RETRY_INTERVAL_SECONDS = 60        # 오류 시 1분 후 재시도
 MAX_COINS_TO_ANALYZE = 10          # 분석할 코인 수 (거래량 상위)
-INVEST_RATIO = 0.3                 # 보유 KRW의 최대 30%까지 투자
+INVEST_RATIO = 0.3                 # 1회 최대 투자 비율
+MAX_CONCENTRATION = 0.3            # 단일 코인 최대 비중 (30%)
 MIN_ORDER_KRW = 6000               # 업비트 최소 주문금액
 STOP_LOSS_PCT = -15                # 손절 기준 (%)
 TAKE_PROFIT_PCT = 30               # 익절 기준 (%)
+PRICE_ALERT_PCT = 5                # 급등/급락 감지 기준 (%)
 TRADE_HISTORY_FILE = "trade_history.json"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -364,6 +366,81 @@ def get_portfolio(upbit) -> dict:
 
 
 # ──────────────────────────────────────────────
+# AI 판단 검증
+# ──────────────────────────────────────────────
+def validate_decisions(decisions: list[dict], portfolio: dict, valid_tickers: set) -> list[dict]:
+    """AI 응답을 검증하여 유효한 결정만 반환"""
+    validated = []
+    for d in decisions:
+        action = d.get("action", "")
+        ticker = d.get("ticker", "")
+
+        # 액션 검증
+        if action not in ("buy", "sell", "hold"):
+            log.warning(f"[검증 실패] 잘못된 action: {action}")
+            continue
+
+        if action == "hold":
+            validated.append(d)
+            continue
+
+        # 티커 검증
+        if ticker not in valid_tickers:
+            log.warning(f"[검증 실패] 존재하지 않는 티커: {ticker}")
+            continue
+
+        # 매도 검증: 보유 여부
+        if action == "sell" and ticker not in portfolio:
+            log.warning(f"[검증 실패] {ticker} 미보유 상태에서 매도 시도")
+            continue
+
+        # sell_ratio 범위 검증
+        if action == "sell":
+            ratio = float(d.get("sell_ratio", 1.0))
+            if ratio <= 0 or ratio > 1:
+                log.warning(f"[검증 실패] {ticker} sell_ratio 범위 초과: {ratio}")
+                continue
+
+        # amount_krw 검증
+        if action == "buy":
+            amount = float(d.get("amount_krw", 0))
+            if amount <= 0:
+                log.warning(f"[검증 실패] {ticker} amount_krw 잘못됨: {amount}")
+                continue
+
+        validated.append(d)
+
+    return validated
+
+
+# ──────────────────────────────────────────────
+# 포트폴리오 집중도 체크
+# ──────────────────────────────────────────────
+def check_concentration(ticker: str, buy_amount_krw: float, portfolio: dict) -> bool:
+    """단일 코인 비중이 MAX_CONCENTRATION을 초과하는지 확인"""
+    # 총 자산 계산
+    total_value = portfolio.get("KRW", 0)
+    for t, info in portfolio.items():
+        if t == "KRW":
+            continue
+        total_value += info.get("value_krw", 0)
+
+    if total_value <= 0:
+        return True
+
+    # 해당 코인의 현재 가치 + 추가 매수액
+    current_value = 0
+    if ticker in portfolio and ticker != "KRW":
+        current_value = portfolio[ticker].get("value_krw", 0)
+    new_concentration = (current_value + buy_amount_krw) / (total_value + buy_amount_krw)
+
+    if new_concentration > MAX_CONCENTRATION:
+        log.warning(f"[집중도 초과] {ticker} 매수 후 비중 {new_concentration*100:.1f}% > {MAX_CONCENTRATION*100:.0f}% 제한")
+        return False
+    return True
+
+
+# ──────────────────────────────────────────────
 # 매매 실행
 # ──────────────────────────────────────────────
 def execute_trade(upbit, decision: dict, portfolio: dict):
@@ -376,6 +453,9 @@ def execute_trade(upbit, decision: dict, portfolio: dict):
         amount_krw = float(decision.get("amount_krw", 0))
         max_invest = krw_balance * INVEST_RATIO
         amount_krw = min(amount_krw, max_invest)
+
+        if not check_concentration(ticker, amount_krw, portfolio):
+            return
 
         if amount_krw < MIN_ORDER_KRW:
             log.warning(f"[BUY 취소] 주문금액 {amount_krw:,.0f}원이 최소금액 미달")
@@ -421,9 +501,10 @@ def main():
             log.info("─── 분석 사이클 시작 ───")
 
             # 1. 거래량 상위 코인 목록 수집
-            tickers = pyupbit.get_tickers(fiat="KRW")
+            all_tickers = pyupbit.get_tickers(fiat="KRW")
+            valid_tickers = set(all_tickers)
             volumes = []
-            for i, t in enumerate(tickers):
+            for i, t in enumerate(all_tickers):
                 try:
                     info = pyupbit.get_ohlcv(t, interval="day", count=1)
                     if info is not None and not info.empty:
@@ -435,20 +516,24 @@ def main():
                     time.sleep(0.5)  # 10개마다 rate limit 방지
             volumes.sort(key=lambda x: x[1], reverse=True)
             top_tickers = [v[0] for v in volumes[:MAX_COINS_TO_ANALYZE]]
-            log.info(f"분석 대상 코인: {top_tickers}")
 
-            # 2. 기술적 지표 수집
+            # 2. 포트폴리오 조회
+            time.sleep(1)
+            portfolio = get_portfolio(upbit)
+            log.info(f"현재 포트폴리오: {portfolio}")
+
+            # 보유 코인도 분석 대상에 포함
+            holding_tickers = [t for t in portfolio if t != "KRW" and t not in top_tickers]
+            analyze_tickers = top_tickers + holding_tickers
+            log.info(f"분석 대상 코인: {analyze_tickers}")
+
+            # 3. 기술적 지표 수집
             indicators_list = []
-            for ticker in top_tickers:
+            for ticker in analyze_tickers:
                 ind = get_technical_indicators(ticker)
                 if ind:
                     indicators_list.append(ind)
                 time.sleep(0.1)
-
-            # 3. 포트폴리오 조회
-            time.sleep(1)  # API rate limit 방지
-            portfolio = get_portfolio(upbit)
-            log.info(f"현재 포트폴리오: {portfolio}")
 
             # 4. 시장 심리 수집
             market_summary = get_market_summary()
@@ -457,9 +542,13 @@ def main():
             # 5. AI 판단 (Claude Code CLI)
             log.info("Claude CLI에게 판단 요청 중...")
             decisions = ask_claude_for_decision(indicators_list, portfolio, market_summary)
-            log.info(f"AI 결정: {decisions}")
+            log.info(f"AI 결정 (원본): {decisions}")
 
-            # 6. 매매 실행
+            # 6. 검증
+            decisions = validate_decisions(decisions, portfolio, valid_tickers)
+            log.info(f"AI 결정 (검증 후): {decisions}")
+
+            # 7. 매매 실행
             for decision in decisions:
                 if decision.get("action", "hold") == "hold":
                     log.info(f"[HOLD] {decision.get('ticker', '')} | {decision.get('reason', '')}")
@@ -476,8 +565,53 @@ def main():
             time.sleep(RETRY_INTERVAL_SECONDS)
             continue
 
-        log.info(f"다음 분석까지 {TRADE_INTERVAL_SECONDS//60}분 대기...\n")
+        log.info(f"다음 분석까지 {TRADE_INTERVAL_SECONDS//60}분 대기 (급변동 감지 중)...\n")
+        if not wait_with_alert(upbit, portfolio):
+            log.info("급변동 감지! 즉시 사이클 재실행")
+
+
+def wait_with_alert(upbit, portfolio: dict) -> bool:
+    """대기 중 급등/급락 감지. 정상 완료 시 True, 급변동 감지 시 False 반환."""
+    # 모니터링 대상: 보유 코인 + BTC
+    watch_tickers = [t for t in portfolio if t != "KRW"]
+    if "KRW-BTC" not in watch_tickers:
+        watch_tickers.append("KRW-BTC")
+
+    # 기준 가격 저장
+    base_prices = {}
+    for t in watch_tickers:
+        try:
+            price = pyupbit.get_current_price(t)
+            if price:
+                base_prices[t] = price
+        except Exception:
+            pass
+
+    if not base_prices:
         time.sleep(TRADE_INTERVAL_SECONDS)
+        return True
+
+    elapsed = 0
+    check_interval = 60  # 1분마다 체크
+    while elapsed < TRADE_INTERVAL_SECONDS:
+        time.sleep(check_interval)
+        elapsed += check_interval
+
+        for t, base_price in base_prices.items():
+            try:
+                current = pyupbit.get_current_price(t)
+                if not current:
+                    continue
+                change_pct = (current / base_price - 1) * 100
+                if abs(change_pct) >= PRICE_ALERT_PCT:
+                    direction = "급등" if change_pct > 0 else "급락"
+                    log.warning(f"[{direction}] {t} {change_pct:+.1f}% ({base_price:,.0f} → {current:,.0f})")
+                    send_telegram(f"⚡ *{direction} 감지* | {t}\n변동: {change_pct:+.1f}%\n{base_price:,.0f} → {current:,.0f}원")
+                    return False
+            except Exception:
+                pass
+
+    return True
 
 
 if __name__ == "__main__":
