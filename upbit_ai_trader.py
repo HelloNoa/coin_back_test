@@ -18,11 +18,14 @@
 """
 
 import os
+import sys
 import time
 import json
+import signal
 import logging
 import subprocess
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -59,7 +62,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("trading_log.txt", encoding="utf-8"),
+        RotatingFileHandler(
+            "trading_log.txt", encoding="utf-8",
+            maxBytes=5 * 1024 * 1024,  # 5MB
+            backupCount=5,             # trading_log.txt.1 ~ .5 보관
+        ),
     ],
 )
 log = logging.getLogger(__name__)
@@ -463,8 +470,23 @@ def execute_trade(upbit, decision: dict, portfolio: dict):
 
         log.info(f"[BUY] {ticker} {amount_krw:,.0f}원 매수 시도 | 이유: {reason}")
         result = upbit.buy_market_order(ticker, amount_krw)
-        log.info(f"[BUY 완료] {result}")
-        send_telegram(f"🟢 *매수* | {ticker}\n금액: {amount_krw:,.0f}원\n사유: {reason}")
+        log.info(f"[BUY 주문] {result}")
+        # 체결 확인
+        if isinstance(result, dict) and "uuid" in result:
+            time.sleep(1)
+            order = upbit.get_order(result["uuid"])
+            if order and "trades" in order:
+                trades = order["trades"]
+                filled_qty = sum(float(t["volume"]) for t in trades)
+                avg_price = sum(float(t["price"]) * float(t["volume"]) for t in trades) / filled_qty if filled_qty else 0
+                fee = float(order.get("paid_fee", 0))
+                log.info(f"[BUY 체결] {ticker} {filled_qty:.6f}개 @ 평균 {avg_price:,.0f}원 | 수수료: {fee:,.0f}원")
+                send_telegram(f"🟢 *매수 체결* | {ticker}\n{filled_qty:.6f}개 @ {avg_price:,.0f}원\n수수료: {fee:,.0f}원\n사유: {reason}")
+            else:
+                send_telegram(f"🟢 *매수* | {ticker}\n금액: {amount_krw:,.0f}원\n사유: {reason}")
+        else:
+            log.warning(f"[BUY 주문 실패] {result}")
+            send_telegram(f"⚠️ *매수 주문 실패* | {ticker}\n{result}")
 
     elif action == "sell":
         sell_ratio = float(decision.get("sell_ratio", 1.0))
@@ -480,15 +502,43 @@ def execute_trade(upbit, decision: dict, portfolio: dict):
 
         log.info(f"[SELL] {ticker} {sell_ratio*100:.0f}% ({sell_amount:.6f}) 매도 시도 | 이유: {reason}")
         result = upbit.sell_market_order(ticker, sell_amount)
-        log.info(f"[SELL 완료] {result}")
+        log.info(f"[SELL 주문] {result}")
         pnl = coin_info["profit_pct"]
-        send_telegram(f"🔴 *매도* | {ticker}\n비율: {sell_ratio*100:.0f}% | 손익: {pnl:+.1f}%\n사유: {reason}")
+        # 체결 확인
+        if isinstance(result, dict) and "uuid" in result:
+            time.sleep(1)
+            order = upbit.get_order(result["uuid"])
+            if order and "trades" in order:
+                trades = order["trades"]
+                filled_qty = sum(float(t["volume"]) for t in trades)
+                avg_price = sum(float(t["price"]) * float(t["volume"]) for t in trades) / filled_qty if filled_qty else 0
+                total_krw = round(filled_qty * avg_price, 0)
+                fee = float(order.get("paid_fee", 0))
+                log.info(f"[SELL 체결] {ticker} {filled_qty:.6f}개 @ 평균 {avg_price:,.0f}원 = {total_krw:,.0f}원 | 수수료: {fee:,.0f}원")
+                send_telegram(f"🔴 *매도 체결* | {ticker}\n{filled_qty:.6f}개 @ {avg_price:,.0f}원\n금액: {total_krw:,.0f}원 | 손익: {pnl:+.1f}%\n수수료: {fee:,.0f}원\n사유: {reason}")
+            else:
+                send_telegram(f"🔴 *매도* | {ticker}\n비율: {sell_ratio*100:.0f}% | 손익: {pnl:+.1f}%\n사유: {reason}")
+        else:
+            log.warning(f"[SELL 주문 실패] {result}")
+            send_telegram(f"⚠️ *매도 주문 실패* | {ticker}\n{result}")
 
 
 # ──────────────────────────────────────────────
 # 메인 루프
 # ──────────────────────────────────────────────
+_shutdown_requested = False
+
+
+def _signal_handler(sig, frame):
+    global _shutdown_requested
+    _shutdown_requested = True
+    log.info("종료 신호 수신, 현재 사이클 완료 후 종료합니다...")
+
+
 def main():
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
     log.info("=" * 50)
     log.info("업비트 AI 자동매매 봇 시작")
     log.info("=" * 50)
@@ -496,25 +546,35 @@ def main():
 
     upbit = pyupbit.Upbit(UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY)
 
-    while True:
+    while not _shutdown_requested:
         try:
             log.info("─── 분석 사이클 시작 ───")
 
-            # 1. 거래량 상위 코인 목록 수집
+            # 1. 거래량 상위 코인 목록 수집 (전체 시세 API 1회 호출)
             all_tickers = pyupbit.get_tickers(fiat="KRW")
             valid_tickers = set(all_tickers)
-            volumes = []
-            for i, t in enumerate(all_tickers):
-                try:
-                    info = pyupbit.get_ohlcv(t, interval="day", count=1)
-                    if info is not None and not info.empty:
-                        vol = info["volume"].iloc[-1] * info["close"].iloc[-1]
-                        volumes.append((t, vol))
-                except Exception:
-                    pass
-                if (i + 1) % 10 == 0:
-                    time.sleep(0.5)  # 10개마다 rate limit 방지
-            volumes.sort(key=lambda x: x[1], reverse=True)
+            try:
+                ticker_info = requests.get(
+                    "https://api.upbit.com/v1/ticker",
+                    params={"markets": ",".join(all_tickers)},
+                    timeout=10,
+                ).json()
+                volumes = [(t["market"], t["acc_trade_price_24h"]) for t in ticker_info]
+                volumes.sort(key=lambda x: x[1], reverse=True)
+            except Exception as e:
+                log.warning(f"전체 시세 조회 실패, 개별 조회로 전환: {e}")
+                volumes = []
+                for i, t in enumerate(all_tickers):
+                    try:
+                        info = pyupbit.get_ohlcv(t, interval="day", count=1)
+                        if info is not None and not info.empty:
+                            vol = info["volume"].iloc[-1] * info["close"].iloc[-1]
+                            volumes.append((t, vol))
+                    except Exception:
+                        pass
+                    if (i + 1) % 10 == 0:
+                        time.sleep(0.5)
+                volumes.sort(key=lambda x: x[1], reverse=True)
             top_tickers = [v[0] for v in volumes[:MAX_COINS_TO_ANALYZE]]
 
             # 2. 포트폴리오 조회
@@ -569,6 +629,12 @@ def main():
         if not wait_with_alert(upbit, portfolio):
             log.info("급변동 감지! 즉시 사이클 재실행")
 
+    # 종료 처리
+    log.info("=" * 50)
+    log.info("봇 안전 종료 완료")
+    log.info("=" * 50)
+    send_telegram("🛑 *업비트 AI 자동매매 봇 종료*")
+
 
 def wait_with_alert(upbit, portfolio: dict) -> bool:
     """대기 중 급등/급락 감지. 정상 완료 시 True, 급변동 감지 시 False 반환."""
@@ -593,10 +659,16 @@ def wait_with_alert(upbit, portfolio: dict) -> bool:
 
     elapsed = 0
     check_interval = 60  # 1분마다 체크
+    last_report_date = datetime.now().strftime('%Y-%m-%d')
+
     while elapsed < TRADE_INTERVAL_SECONDS:
+        if _shutdown_requested:
+            return True
+
         time.sleep(check_interval)
         elapsed += check_interval
 
+        # 급변동 체크
         for t, base_price in base_prices.items():
             try:
                 current = pyupbit.get_current_price(t)
@@ -611,7 +683,43 @@ def wait_with_alert(upbit, portfolio: dict) -> bool:
             except Exception:
                 pass
 
+        # 일일 성과 리포트 (자정 직후 1회)
+        now_date = datetime.now().strftime('%Y-%m-%d')
+        if now_date != last_report_date and datetime.now().hour == 0:
+            last_report_date = now_date
+            send_daily_report(upbit)
+
     return True
+
+
+def send_daily_report(upbit):
+    """일일 거래 요약 + 총 자산 현황을 텔레그램으로 전송"""
+    try:
+        portfolio = get_portfolio(upbit)
+        total_value = portfolio.get("KRW", 0)
+        holdings_text = []
+        for t, info in portfolio.items():
+            if t == "KRW":
+                continue
+            total_value += info["value_krw"]
+            holdings_text.append(f"  {t}: {info['value_krw']:,.0f}원 ({info['profit_pct']:+.1f}%)")
+
+        # 당일 거래 이력
+        history = load_trade_history()
+        today = datetime.now().strftime('%Y-%m-%d')
+        today_trades = [h for h in history if h.get("time", "").startswith(today)]
+
+        report = f"📊 *일일 리포트* ({today})\n"
+        report += f"총 자산: {total_value:,.0f}원\n"
+        report += f"현금: {portfolio.get('KRW', 0):,.0f}원\n"
+        if holdings_text:
+            report += "보유:\n" + "\n".join(holdings_text) + "\n"
+        report += f"당일 거래: {len(today_trades)}건"
+
+        log.info(report)
+        send_telegram(report)
+    except Exception as e:
+        log.warning(f"일일 리포트 생성 실패: {e}")
 
 
 if __name__ == "__main__":
