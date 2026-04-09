@@ -37,11 +37,17 @@ TELEGRAM_CHAT_ID=채팅ID
 python upbit_ai_trader.py
 ```
 
-- 30분마다 분석 사이클 실행
-- KRW 마켓 거래대금 상위 10개 코인 분석
-- 다중 타임프레임 지표 (15분/1시간/일봉)
-- 매매 시 텔레그램 알림 (설정 시)
-- 거래 이력: `trade_history.json` / 로그: `trading_log.txt`
+- 30분마다 분석 사이클 실행 (대기 중 급변동 감지 시 즉시 재실행)
+- KRW 마켓 거래대금 상위 10개 + 보유 코인 분석
+- 다중 타임프레임 지표 (15분/1시간/일봉) + 오더북 매수/매도 압력
+- 분할 매수/매도 (3회 분할, 슬리피지 최소화)
+- 주문 체결 확인 (실제 체결가, 수량, 수수료 조회)
+- AI 응답 검증 (잘못된 티커, 미보유 매도 등 사전 필터링)
+- 단일 코인 최대 비중 30% 제한
+- 과거 AI 판단 정확도 추적 및 피드백
+- 매매 시 텔레그램 알림 + 자정 일일 성과 리포트
+- Ctrl+C 시 현재 사이클 완료 후 안전 종료
+- 거래 이력: `trade_history.json` / 로그: `trading_log.txt` (5MB × 5파일 로테이션)
 
 **주요 설정값** (`upbit_ai_trader.py` 상단):
 
@@ -50,9 +56,12 @@ python upbit_ai_trader.py
 | `TRADE_INTERVAL_SECONDS` | 1800 | 분석 주기 (초) |
 | `MAX_COINS_TO_ANALYZE` | 10 | 분석 코인 수 |
 | `INVEST_RATIO` | 0.3 | 1회 최대 투자 비율 |
+| `MAX_CONCENTRATION` | 0.3 | 단일 코인 최대 비중 |
 | `MIN_ORDER_KRW` | 6000 | 최소 주문 금액 |
 | `STOP_LOSS_PCT` | -15 | 손절 기준 (%) |
 | `TAKE_PROFIT_PCT` | 30 | 익절 기준 (%) |
+| `PRICE_ALERT_PCT` | 5 | 급변동 감지 기준 (%) |
+| `SPLIT_ORDER_COUNT` | 3 | 분할 주문 횟수 |
 
 ### 드라이런 — `upbit_ai_dryrun.py`
 
@@ -66,7 +75,8 @@ python upbit_ai_dryrun.py --interval 300     # 5분 간격
 python upbit_ai_dryrun.py --reset            # 포트폴리오 초기화 후 시작
 ```
 
-- 수수료 0.05% 반영
+- 실전과 동일한 분석/AI/검증 로직 사용 (임포트)
+- 수수료 0.05% 반영, 집중도 체크 적용
 - 매 사이클마다 총 자산/손익 리포트 출력
 - 가상 포트폴리오: `dryrun_portfolio.json` (재시작해도 유지)
 - 거래 이력: `dryrun_history.json` / 로그: `dryrun_log.txt`
@@ -77,7 +87,9 @@ python upbit_ai_dryrun.py --reset            # 포트폴리오 초기화 후 시
 - MACD 모멘텀
 - 볼린저밴드 위치
 - 거래량 급증/감소 (20기간 평균 대비)
+- 오더북 매수/매도 압력 비율
 - 일봉 추세 방향 (MA5 vs MA20)
 - 공포탐욕지수
 - 김치 프리미엄 (업비트 vs 바이낸스)
+- 과거 AI 판단 정확도 피드백
 - 손절/익절 기준

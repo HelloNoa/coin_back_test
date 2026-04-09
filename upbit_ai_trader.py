@@ -49,6 +49,8 @@ MIN_ORDER_KRW = 6000               # 업비트 최소 주문금액
 STOP_LOSS_PCT = -15                # 손절 기준 (%)
 TAKE_PROFIT_PCT = 30               # 익절 기준 (%)
 PRICE_ALERT_PCT = 5                # 급등/급락 감지 기준 (%)
+SPLIT_ORDER_COUNT = 3              # 분할 매매 횟수
+SPLIT_ORDER_DELAY = 5              # 분할 주문 간 대기 (초)
 TRADE_HISTORY_FILE = "trade_history.json"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -106,6 +108,34 @@ def save_trade_record(record: dict):
     history = history[-50:]
     with open(TRADE_HISTORY_FILE, "w") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
+
+
+def evaluate_past_decisions() -> str:
+    """과거 매매 판단의 정확도를 현재 가격과 비교하여 요약"""
+    history = load_trade_history()
+    if not history:
+        return "없음"
+
+    evaluations = []
+    for record in history[-10:]:
+        ticker = record.get("ticker", "")
+        action = record.get("action", "")
+        trade_price = record.get("trade_price", 0)
+        if not ticker or not trade_price or action == "hold":
+            continue
+        try:
+            current_price = pyupbit.get_current_price(ticker)
+            if not current_price:
+                continue
+        except Exception:
+            continue
+        change_pct = round((current_price / trade_price - 1) * 100, 2)
+        correct = (action == "buy" and change_pct > 0) or (action == "sell" and change_pct < 0)
+        evaluations.append(
+            f"{record.get('time', '?')} {action.upper()} {ticker} @ {trade_price:,.0f} → 현재 {current_price:,.0f} ({change_pct:+.1f}%) {'✓' if correct else '✗'}"
+        )
+
+    return "\n".join(evaluations) if evaluations else "없음"
 
 
 # ──────────────────────────────────────────────
@@ -208,6 +238,34 @@ def get_technical_indicators(ticker: str) -> dict:
 
 
 # ──────────────────────────────────────────────
+# 오더북 분석
+# ──────────────────────────────────────────────
+def get_orderbook_summary(ticker: str) -> dict:
+    """호가 데이터에서 매수/매도 압력 요약"""
+    try:
+        orderbook = pyupbit.get_orderbook(ticker)
+        if not orderbook or not isinstance(orderbook, list):
+            return {}
+        units = orderbook[0].get("orderbook_units", [])
+        if not units:
+            return {}
+
+        bid_total = sum(u["bid_size"] * u["bid_price"] for u in units)  # 매수 대기 금액
+        ask_total = sum(u["ask_size"] * u["ask_price"] for u in units)  # 매도 대기 금액
+        pressure = round(bid_total / ask_total, 2) if ask_total > 0 else 0
+        spread = round((units[0]["ask_price"] / units[0]["bid_price"] - 1) * 100, 4)
+
+        return {
+            "bid_total_krw": round(bid_total, 0),
+            "ask_total_krw": round(ask_total, 0),
+            "buy_pressure": pressure,  # >1이면 매수 우세, <1이면 매도 우세
+            "spread_pct": spread,
+        }
+    except Exception:
+        return {}
+
+
+# ──────────────────────────────────────────────
 # 시장 심리 수집
 # ──────────────────────────────────────────────
 def get_kimchi_premium() -> str:
@@ -305,6 +363,11 @@ def ask_claude_for_decision(
 
 최근 거래 이력 (참고용):
 {json.dumps(recent_history, ensure_ascii=False, indent=2) if recent_history else "없음"}
+
+과거 판단 정확도 (판단 시점 가격 → 현재 가격, ✓=정확 ✗=오판):
+{evaluate_past_decisions()}
+
+참고: 각 코인의 orderbook 항목에서 buy_pressure > 1이면 매수 우세, < 1이면 매도 우세입니다.
 
 위 데이터를 종합하여 최적의 매매 결정을 JSON 배열로만 응답하세요."""
 
@@ -468,25 +531,34 @@ def execute_trade(upbit, decision: dict, portfolio: dict):
             log.warning(f"[BUY 취소] 주문금액 {amount_krw:,.0f}원이 최소금액 미달")
             return
 
-        log.info(f"[BUY] {ticker} {amount_krw:,.0f}원 매수 시도 | 이유: {reason}")
-        result = upbit.buy_market_order(ticker, amount_krw)
-        log.info(f"[BUY 주문] {result}")
-        # 체결 확인
-        if isinstance(result, dict) and "uuid" in result:
-            time.sleep(1)
-            order = upbit.get_order(result["uuid"])
-            if order and "trades" in order:
-                trades = order["trades"]
-                filled_qty = sum(float(t["volume"]) for t in trades)
-                avg_price = sum(float(t["price"]) * float(t["volume"]) for t in trades) / filled_qty if filled_qty else 0
-                fee = float(order.get("paid_fee", 0))
-                log.info(f"[BUY 체결] {ticker} {filled_qty:.6f}개 @ 평균 {avg_price:,.0f}원 | 수수료: {fee:,.0f}원")
-                send_telegram(f"🟢 *매수 체결* | {ticker}\n{filled_qty:.6f}개 @ {avg_price:,.0f}원\n수수료: {fee:,.0f}원\n사유: {reason}")
+        # 분할 매수
+        split_count = SPLIT_ORDER_COUNT if amount_krw >= MIN_ORDER_KRW * SPLIT_ORDER_COUNT else 1
+        split_amount = round(amount_krw / split_count, 0)
+        log.info(f"[BUY] {ticker} 총 {amount_krw:,.0f}원 ({split_count}회 분할) | 이유: {reason}")
+
+        total_filled_qty = 0
+        total_fee = 0
+        for i in range(split_count):
+            result = upbit.buy_market_order(ticker, split_amount)
+            log.info(f"[BUY {i+1}/{split_count}] {result}")
+            if isinstance(result, dict) and "uuid" in result:
+                time.sleep(1)
+                order = upbit.get_order(result["uuid"])
+                if order and "trades" in order:
+                    for t in order["trades"]:
+                        total_filled_qty += float(t["volume"])
+                    total_fee += float(order.get("paid_fee", 0))
             else:
-                send_telegram(f"🟢 *매수* | {ticker}\n금액: {amount_krw:,.0f}원\n사유: {reason}")
+                log.warning(f"[BUY {i+1}/{split_count} 실패] {result}")
+            if i < split_count - 1:
+                time.sleep(SPLIT_ORDER_DELAY)
+
+        if total_filled_qty > 0:
+            avg_price = round(amount_krw / total_filled_qty, 0) if total_filled_qty else 0
+            log.info(f"[BUY 완료] {ticker} {total_filled_qty:.6f}개 @ 평균 {avg_price:,.0f}원 | 수수료: {total_fee:,.0f}원")
+            send_telegram(f"🟢 *매수 체결* | {ticker}\n{total_filled_qty:.6f}개 @ {avg_price:,.0f}원 ({split_count}회 분할)\n수수료: {total_fee:,.0f}원\n사유: {reason}")
         else:
-            log.warning(f"[BUY 주문 실패] {result}")
-            send_telegram(f"⚠️ *매수 주문 실패* | {ticker}\n{result}")
+            send_telegram(f"⚠️ *매수 실패* | {ticker}\n{amount_krw:,.0f}원")
 
     elif action == "sell":
         sell_ratio = float(decision.get("sell_ratio", 1.0))
@@ -500,27 +572,34 @@ def execute_trade(upbit, decision: dict, portfolio: dict):
             log.warning(f"[SELL 취소] 매도 금액이 최소금액 미달")
             return
 
-        log.info(f"[SELL] {ticker} {sell_ratio*100:.0f}% ({sell_amount:.6f}) 매도 시도 | 이유: {reason}")
-        result = upbit.sell_market_order(ticker, sell_amount)
-        log.info(f"[SELL 주문] {result}")
         pnl = coin_info["profit_pct"]
-        # 체결 확인
-        if isinstance(result, dict) and "uuid" in result:
-            time.sleep(1)
-            order = upbit.get_order(result["uuid"])
-            if order and "trades" in order:
-                trades = order["trades"]
-                filled_qty = sum(float(t["volume"]) for t in trades)
-                avg_price = sum(float(t["price"]) * float(t["volume"]) for t in trades) / filled_qty if filled_qty else 0
-                total_krw = round(filled_qty * avg_price, 0)
-                fee = float(order.get("paid_fee", 0))
-                log.info(f"[SELL 체결] {ticker} {filled_qty:.6f}개 @ 평균 {avg_price:,.0f}원 = {total_krw:,.0f}원 | 수수료: {fee:,.0f}원")
-                send_telegram(f"🔴 *매도 체결* | {ticker}\n{filled_qty:.6f}개 @ {avg_price:,.0f}원\n금액: {total_krw:,.0f}원 | 손익: {pnl:+.1f}%\n수수료: {fee:,.0f}원\n사유: {reason}")
+        sell_krw_est = sell_amount * coin_info["current_price"]
+        split_count = SPLIT_ORDER_COUNT if sell_krw_est >= MIN_ORDER_KRW * SPLIT_ORDER_COUNT else 1
+        split_qty = sell_amount / split_count
+        log.info(f"[SELL] {ticker} {sell_ratio*100:.0f}% ({sell_amount:.6f}개, {split_count}회 분할) | 이유: {reason}")
+
+        total_filled_krw = 0
+        total_fee = 0
+        for i in range(split_count):
+            result = upbit.sell_market_order(ticker, split_qty)
+            log.info(f"[SELL {i+1}/{split_count}] {result}")
+            if isinstance(result, dict) and "uuid" in result:
+                time.sleep(1)
+                order = upbit.get_order(result["uuid"])
+                if order and "trades" in order:
+                    for t in order["trades"]:
+                        total_filled_krw += float(t["price"]) * float(t["volume"])
+                    total_fee += float(order.get("paid_fee", 0))
             else:
-                send_telegram(f"🔴 *매도* | {ticker}\n비율: {sell_ratio*100:.0f}% | 손익: {pnl:+.1f}%\n사유: {reason}")
+                log.warning(f"[SELL {i+1}/{split_count} 실패] {result}")
+            if i < split_count - 1:
+                time.sleep(SPLIT_ORDER_DELAY)
+
+        if total_filled_krw > 0:
+            log.info(f"[SELL 완료] {ticker} {total_filled_krw:,.0f}원 | 손익: {pnl:+.1f}% | 수수료: {total_fee:,.0f}원")
+            send_telegram(f"🔴 *매도 체결* | {ticker}\n금액: {total_filled_krw:,.0f}원 ({split_count}회 분할)\n손익: {pnl:+.1f}% | 수수료: {total_fee:,.0f}원\n사유: {reason}")
         else:
-            log.warning(f"[SELL 주문 실패] {result}")
-            send_telegram(f"⚠️ *매도 주문 실패* | {ticker}\n{result}")
+            send_telegram(f"⚠️ *매도 실패* | {ticker}")
 
 
 # ──────────────────────────────────────────────
@@ -587,11 +666,14 @@ def main():
             analyze_tickers = top_tickers + holding_tickers
             log.info(f"분석 대상 코인: {analyze_tickers}")
 
-            # 3. 기술적 지표 수집
+            # 3. 기술적 지표 + 오더북 수집
             indicators_list = []
             for ticker in analyze_tickers:
                 ind = get_technical_indicators(ticker)
                 if ind:
+                    ob = get_orderbook_summary(ticker)
+                    if ob:
+                        ind["orderbook"] = ob
                     indicators_list.append(ind)
                 time.sleep(0.1)
 
@@ -614,8 +696,15 @@ def main():
                     log.info(f"[HOLD] {decision.get('ticker', '')} | {decision.get('reason', '')}")
                     continue
                 execute_trade(upbit, decision, portfolio)
+                # 체결가 기록 (정확도 추적용)
+                trade_price = 0
+                try:
+                    trade_price = pyupbit.get_current_price(decision.get("ticker", "")) or 0
+                except Exception:
+                    pass
                 save_trade_record({
                     "time": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                    "trade_price": trade_price,
                     **decision,
                 })
 

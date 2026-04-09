@@ -30,10 +30,14 @@ import requests
 # upbit_ai_trader에서 공용 함수 임포트
 from upbit_ai_trader import (
     get_technical_indicators,
+    get_orderbook_summary,
     get_market_summary,
     ask_claude_for_decision,
+    validate_decisions,
+    check_concentration,
     load_trade_history,
     MAX_COINS_TO_ANALYZE,
+    MAX_CONCENTRATION,
     INVEST_RATIO,
     MIN_ORDER_KRW,
 )
@@ -125,6 +129,12 @@ def execute_dryrun_trade(decision: dict, portfolio: dict) -> dict | None:
         if amount_krw < MIN_ORDER_KRW:
             log.warning(f"[BUY 스킵] {ticker} 주문금액 {amount_krw:,.0f}원 < 최소금액")
             return None
+
+        # 집중도 체크
+        ai_portfolio = get_portfolio_for_ai(portfolio)
+        if not check_concentration(ticker, amount_krw, ai_portfolio):
+            return None
+
         if amount_krw > portfolio["KRW"]:
             log.warning(f"[BUY 스킵] {ticker} 잔액 부족 (필요: {amount_krw:,.0f}, 보유: {portfolio['KRW']:,.0f})")
             return None
@@ -243,34 +253,52 @@ def main():
         try:
             log.info(f"─── 사이클 #{cycle} 시작 ───")
 
-            # 1. 거래량 상위 코인 목록 수집
-            tickers = pyupbit.get_tickers(fiat="KRW")
-            volumes = []
-            for i, t in enumerate(tickers):
-                try:
-                    info = pyupbit.get_ohlcv(t, interval="day", count=1)
-                    if info is not None and not info.empty:
-                        vol = info["volume"].iloc[-1] * info["close"].iloc[-1]
-                        volumes.append((t, vol))
-                except Exception:
-                    pass
-                if (i + 1) % 10 == 0:
-                    time.sleep(0.5)
-            volumes.sort(key=lambda x: x[1], reverse=True)
+            # 1. 거래량 상위 코인 목록 수집 (전체 시세 API 1회 호출)
+            all_tickers = pyupbit.get_tickers(fiat="KRW")
+            valid_tickers = set(all_tickers)
+            try:
+                ticker_info = requests.get(
+                    "https://api.upbit.com/v1/ticker",
+                    params={"markets": ",".join(all_tickers)},
+                    timeout=10,
+                ).json()
+                volumes = [(t["market"], t["acc_trade_price_24h"]) for t in ticker_info]
+                volumes.sort(key=lambda x: x[1], reverse=True)
+            except Exception as e:
+                log.warning(f"전체 시세 조회 실패, 개별 조회로 전환: {e}")
+                volumes = []
+                for i, t in enumerate(all_tickers):
+                    try:
+                        info = pyupbit.get_ohlcv(t, interval="day", count=1)
+                        if info is not None and not info.empty:
+                            vol = info["volume"].iloc[-1] * info["close"].iloc[-1]
+                            volumes.append((t, vol))
+                    except Exception:
+                        pass
+                    if (i + 1) % 10 == 0:
+                        time.sleep(0.5)
+                volumes.sort(key=lambda x: x[1], reverse=True)
             top_tickers = [v[0] for v in volumes[:MAX_COINS_TO_ANALYZE]]
-            log.info(f"분석 대상: {top_tickers}")
 
-            # 2. 기술적 지표 수집
-            indicators_list = []
-            for ticker in top_tickers:
-                ind = get_technical_indicators(ticker)
-                if ind:
-                    indicators_list.append(ind)
-                time.sleep(0.1)
-
-            # 3. 포트폴리오 (가상)
+            # 2. 포트폴리오 (가상)
             ai_portfolio = get_portfolio_for_ai(portfolio)
             log.info(f"포트폴리오: {json.dumps(ai_portfolio, ensure_ascii=False)}")
+
+            # 보유 코인도 분석 대상에 포함
+            holding_tickers = [t for t in ai_portfolio if t != "KRW" and t not in top_tickers]
+            analyze_tickers = top_tickers + holding_tickers
+            log.info(f"분석 대상: {analyze_tickers}")
+
+            # 3. 기술적 지표 + 오더북 수집
+            indicators_list = []
+            for ticker in analyze_tickers:
+                ind = get_technical_indicators(ticker)
+                if ind:
+                    ob = get_orderbook_summary(ticker)
+                    if ob:
+                        ind["orderbook"] = ob
+                    indicators_list.append(ind)
+                time.sleep(0.1)
 
             # 4. 시장 심리
             market_summary = get_market_summary()
@@ -279,9 +307,13 @@ def main():
             # 5. AI 판단
             log.info("Claude CLI 판단 요청 중...")
             decisions = ask_claude_for_decision(indicators_list, ai_portfolio, market_summary)
-            log.info(f"AI 결정: {decisions}")
+            log.info(f"AI 결정 (원본): {decisions}")
 
-            # 6. 가상 매매 실행
+            # 6. 검증
+            decisions = validate_decisions(decisions, ai_portfolio, valid_tickers)
+            log.info(f"AI 결정 (검증 후): {decisions}")
+
+            # 7. 가상 매매 실행
             for decision in decisions:
                 if decision.get("action", "hold") == "hold":
                     log.info(f"[HOLD] {decision.get('ticker', '')} | {decision.get('reason', '')}")
@@ -291,6 +323,7 @@ def main():
                     save_dryrun_record({
                         "time": datetime.now().strftime('%Y-%m-%d %H:%M'),
                         "cycle": cycle,
+                        "trade_price": trade_result.get("price", 0),
                         **trade_result,
                     })
 
