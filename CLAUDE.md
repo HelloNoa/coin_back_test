@@ -1,0 +1,50 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## 프로젝트 개요
+
+업비트 AI 자동 암호화폐 매매 봇. Claude Code CLI(`claude -p`)를 subprocess로 호출하여 기술적 지표, 시장 심리, 포트폴리오 상태를 기반으로 매수/매도/홀드 결정을 내린다. 업비트 거래소의 KRW 마켓을 대상으로 한다.
+
+## 실행 방법
+
+```bash
+# 가상환경 활성화
+source .venv/bin/activate
+
+# 의존성 설치
+pip install pyupbit pandas requests python-dotenv
+
+# 트레이딩 봇 실행 (.env에 API 키 필요)
+python upbit_ai_trader.py
+```
+
+## 환경변수 (.env)
+
+- `UPBIT_ACCESS_KEY` / `UPBIT_SECRET_KEY` — 업비트 API 인증 키
+- `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — 텔레그램 알림 (선택)
+- `ANTHROPIC_API_KEY` — Claude CLI subprocess 환경에서 의도적으로 제외됨
+
+## 아키텍처
+
+**`upbit_ai_trader.py`** — 단일 파일 봇, 30분 주기 무한 루프:
+1. 업비트에서 거래량 상위 코인 목록 수집
+2. 다중 타임프레임 기술적 지표 계산 (15분/1시간/일봉): RSI, MACD, 볼린저밴드, 거래량 비율
+3. 시장 심리 수집 (공포/탐욕 지수, 바이낸스 비교를 통한 김치 프리미엄)
+4. Claude Code CLI subprocess 호출 → JSON 배열 형태의 매매 결정 수신
+5. pyupbit으로 시장가 주문 실행, 포지션 제한(거래당 최대 30%), 손절(-15%), 익절(+30%) 적용
+6. `trading_log.txt`에 로그 기록 및 텔레그램 알림 전송
+
+**`ignore/`** — 실험/스크래치 스크립트 (git 제외):
+
+## 주요 설계 결정
+
+- AI 판단은 API 직접 호출이 아닌 `claude -p` CLI 셸아웃 방식 → 호스트에 Claude Code CLI 설치 및 인증 필수
+- subprocess 환경에서 `ANTHROPIC_API_KEY`를 의도적으로 제거하여 충돌 방지
+- 거래 이력은 `trade_history.json`에 최근 50건만 유지, 마지막 10건을 Claude에 컨텍스트로 전달
+- 업비트 API 쓰로틀링 방지를 위해 요청 간 `time.sleep()` 적용
+
+## Git 커밋 규칙
+
+- 커밋 메시지에 `Co-Authored-By: Claude` 또는 Claude Code 관련 링크를 포함하지 말 것
+- 간결하고 명확한 커밋 메시지 작성 (conventional commits 형식)

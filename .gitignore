@@ -1,0 +1,4 @@
+.env
+trade_history.json
+trading_log.txt
+ignore/*
