@@ -690,16 +690,24 @@ def main():
             decisions = validate_decisions(decisions, portfolio, valid_tickers)
             log.info(f"AI 결정 (검증 후): {decisions}")
 
-            # 7. 매매 실행
+            # 7. 매매 실행 + 판단 요약 수집
+            summary_lines = []
             for decision in decisions:
-                if decision.get("action", "hold") == "hold":
-                    log.info(f"[HOLD] {decision.get('ticker', '')} | {decision.get('reason', '')}")
+                action = decision.get("action", "hold")
+                ticker = decision.get("ticker", "")
+                reason = decision.get("reason", "")
+
+                if action == "hold":
+                    log.info(f"[HOLD] {ticker} | {reason}")
+                    summary_lines.append(f"⏸ {ticker}: {reason}")
                     continue
+
                 execute_trade(upbit, decision, portfolio)
+                summary_lines.append(f"{'🟢 BUY' if action == 'buy' else '🔴 SELL'} {ticker}: {reason}")
                 # 체결가 기록 (정확도 추적용)
                 trade_price = 0
                 try:
-                    trade_price = pyupbit.get_current_price(decision.get("ticker", "")) or 0
+                    trade_price = pyupbit.get_current_price(ticker) or 0
                 except Exception:
                     pass
                 save_trade_record({
@@ -707,6 +715,12 @@ def main():
                     "trade_price": trade_price,
                     **decision,
                 })
+
+            # 사이클 판단 요약 텔레그램 전송
+            if summary_lines:
+                now = datetime.now().strftime('%H:%M')
+                summary = f"📋 *사이클 요약* ({now})\n" + "\n".join(summary_lines)
+                send_telegram(summary)
 
         except Exception as e:
             log.error(f"사이클 오류: {e}", exc_info=True)
