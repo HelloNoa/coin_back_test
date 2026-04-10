@@ -23,6 +23,7 @@ import json
 import signal
 import logging
 import subprocess
+import threading
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 
@@ -388,6 +389,7 @@ def ask_claude_for_decision(
 - 익절: 보유 코인이 +{TAKE_PROFIT_PCT}% 이상 수익이면 일부 매도 고려
 - 리스크 관리: 단일 거래에 전체 자산의 30% 이상 투자 금지
 - 1회 매수 금액 상한: {MAX_INVEST_KRW:,.0f}원 (이 금액을 초과하는 amount_krw는 자동으로 잘림)
+- 매도 가능 여부: 포트폴리오 항목의 sellable=false인 코인은 보유량이 최소주문금액({MIN_ORDER_KRW:,}원) 미달이므로 절대 sell 결정을 내리지 마세요 (hold만 가능)
 
 현재 시각: {datetime.now().strftime('%Y-%m-%d %H:%M')}
 시장 심리: {market_summary}
@@ -496,12 +498,14 @@ def get_portfolio(upbit) -> dict:
         current_price = prices.get(ticker, 0)
         if not current_price:
             continue
+        value_krw = round(amount * current_price, 0)
         portfolio[ticker] = {
             "amount": amount,
             "avg_buy_price": avg_price,
             "current_price": current_price,
             "profit_pct": round((current_price / avg_price - 1) * 100, 2) if avg_price > 0 else 0,
-            "value_krw": round(amount * current_price, 0),
+            "value_krw": value_krw,
+            "sellable": value_krw >= MIN_ORDER_KRW,
         }
     return portfolio
 
@@ -539,6 +543,11 @@ def validate_decisions(decisions: list[dict], portfolio: dict, valid_tickers: se
         # 매도 검증: 보유 여부
         if action == "sell" and ticker not in portfolio:
             log.warning(f"[검증 실패] {ticker} 미보유 상태에서 매도 시도")
+            continue
+
+        # 매도 검증: 최소주문금액 미달
+        if action == "sell" and not portfolio.get(ticker, {}).get("sellable", False):
+            log.warning(f"[검증 실패] {ticker} 보유량이 최소주문금액 미달, 매도 불가")
             continue
 
         # sell_ratio 범위 검증
@@ -592,6 +601,21 @@ def check_concentration(ticker: str, buy_amount_krw: float, portfolio: dict) -> 
 # ──────────────────────────────────────────────
 # 매매 실행
 # ──────────────────────────────────────────────
+def _place_order_with_retry(order_func, *args, max_retries: int = 3) -> dict | None:
+    """주문 실행. 네트워크 에러 등으로 실패 시 재시도. 성공한 dict 응답 반환, 끝까지 실패 시 None."""
+    for attempt in range(max_retries):
+        try:
+            result = order_func(*args)
+            if isinstance(result, dict) and "uuid" in result:
+                return result
+            log.warning(f"[주문 재시도 {attempt+1}/{max_retries}] 응답 이상: {result}")
+        except Exception as e:
+            log.warning(f"[주문 재시도 {attempt+1}/{max_retries}] 예외: {e}")
+        if attempt < max_retries - 1:
+            time.sleep(2)
+    return None
+
+
 def execute_trade(upbit, decision: dict, portfolio: dict) -> bool:
     """매매 실행. 실제 체결되면 True, 취소/실패면 False 반환."""
     action = decision.get("action", "hold")
@@ -619,9 +643,9 @@ def execute_trade(upbit, decision: dict, portfolio: dict) -> bool:
         total_filled_qty = 0
         total_fee = 0
         for i in range(split_count):
-            result = upbit.buy_market_order(ticker, split_amount)
+            result = _place_order_with_retry(upbit.buy_market_order, ticker, split_amount)
             log.info(f"[BUY {i+1}/{split_count}] {result}")
-            if isinstance(result, dict) and "uuid" in result:
+            if result:
                 time.sleep(1)
                 order = upbit.get_order(result["uuid"])
                 if order and "trades" in order:
@@ -629,7 +653,7 @@ def execute_trade(upbit, decision: dict, portfolio: dict) -> bool:
                         total_filled_qty += float(t["volume"])
                     total_fee += float(order.get("paid_fee", 0))
             else:
-                log.warning(f"[BUY {i+1}/{split_count} 실패] {result}")
+                log.warning(f"[BUY {i+1}/{split_count} 실패] 재시도 후에도 실패")
                 break
             if i < split_count - 1:
                 time.sleep(SPLIT_ORDER_DELAY)
@@ -664,9 +688,9 @@ def execute_trade(upbit, decision: dict, portfolio: dict) -> bool:
         total_filled_krw = 0
         total_fee = 0
         for i in range(split_count):
-            result = upbit.sell_market_order(ticker, split_qty)
+            result = _place_order_with_retry(upbit.sell_market_order, ticker, split_qty)
             log.info(f"[SELL {i+1}/{split_count}] {result}")
-            if isinstance(result, dict) and "uuid" in result:
+            if result:
                 time.sleep(1)
                 order = upbit.get_order(result["uuid"])
                 if order and "trades" in order:
@@ -674,7 +698,7 @@ def execute_trade(upbit, decision: dict, portfolio: dict) -> bool:
                         total_filled_krw += float(t["price"]) * float(t["volume"])
                     total_fee += float(order.get("paid_fee", 0))
             else:
-                log.warning(f"[SELL {i+1}/{split_count} 실패] {result}")
+                log.warning(f"[SELL {i+1}/{split_count} 실패] 재시도 후에도 실패")
                 break
             if i < split_count - 1:
                 time.sleep(SPLIT_ORDER_DELAY)
@@ -694,11 +718,13 @@ def execute_trade(upbit, decision: dict, portfolio: dict) -> bool:
 # 메인 루프
 # ──────────────────────────────────────────────
 _shutdown_requested = False
+_shutdown_event = threading.Event()
 
 
 def _signal_handler(sig, frame):
     global _shutdown_requested
     _shutdown_requested = True
+    _shutdown_event.set()
     log.info("종료 신호 수신, 현재 사이클 완료 후 종료합니다...")
 
 
@@ -749,8 +775,11 @@ def main():
             portfolio = get_portfolio(upbit)
             log.info(f"현재 포트폴리오: {portfolio}")
 
-            # 보유 코인도 분석 대상에 포함
-            holding_tickers = [t for t in portfolio if t != "KRW" and t not in top_tickers]
+            # 매도 가능한 보유 코인만 분석 대상에 포함 (dust 제외)
+            holding_tickers = [
+                t for t, info in portfolio.items()
+                if t != "KRW" and isinstance(info, dict) and info.get("sellable", False) and t not in top_tickers
+            ]
             analyze_tickers = top_tickers + holding_tickers
             log.info(f"분석 대상 코인: {analyze_tickers}")
 
@@ -816,13 +845,15 @@ def main():
         except Exception as e:
             log.error(f"사이클 오류: {e}", exc_info=True)
             log.info(f"오류 발생, {RETRY_INTERVAL_SECONDS}초 후 재시도...")
-            time.sleep(RETRY_INTERVAL_SECONDS)
+            if _shutdown_event.wait(RETRY_INTERVAL_SECONDS):
+                break
             continue
 
         log.info(f"다음 분석까지 {TRADE_INTERVAL_SECONDS//60}분 대기 (급변동 감지 중)...\n")
         if not wait_with_alert(upbit, portfolio):
             log.info(f"급변동 감지! {ALERT_COOLDOWN_SECONDS}초 쿨다운 후 사이클 재실행")
-            time.sleep(ALERT_COOLDOWN_SECONDS)
+            if _shutdown_event.wait(ALERT_COOLDOWN_SECONDS):
+                break
 
     # 종료 처리
     log.info("=" * 50)
@@ -851,7 +882,8 @@ def wait_with_alert(upbit, portfolio: dict) -> bool:
             pass
 
     if not base_prices:
-        time.sleep(TRADE_INTERVAL_SECONDS)
+        if _shutdown_event.wait(TRADE_INTERVAL_SECONDS):
+            return True
         return True
 
     elapsed = 0
@@ -859,10 +891,8 @@ def wait_with_alert(upbit, portfolio: dict) -> bool:
     last_report_date = datetime.now().strftime('%Y-%m-%d')
 
     while elapsed < TRADE_INTERVAL_SECONDS:
-        if _shutdown_requested:
+        if _shutdown_event.wait(check_interval):
             return True
-
-        time.sleep(check_interval)
         elapsed += check_interval
 
         # 급변동 체크 (일괄 조회)
@@ -905,23 +935,23 @@ def send_daily_report(upbit):
             total_value += info["value_krw"]
             holdings_text.append(f"  {t}: {info['value_krw']:,.0f}원 ({info['profit_pct']:+.1f}%)")
 
-        # 당일 거래 이력
+        # 전일 거래 이력 (자정 리포트는 직전 날짜 기준)
         history = load_trade_history()
-        today = datetime.now().strftime('%Y-%m-%d')
-        today_trades = [h for h in history if h.get("time", "").startswith(today)]
+        report_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        day_trades = [h for h in history if h.get("time", "").startswith(report_date)]
 
-        report = f"📊 *일일 리포트* ({today})\n"
+        report = f"📊 *일일 리포트* ({report_date})\n"
         report += f"총 자산: {total_value:,.0f}원\n"
         report += f"현금: {portfolio.get('KRW', 0):,.0f}원\n"
         if holdings_text:
             report += "보유:\n" + "\n".join(holdings_text) + "\n"
-        report += f"당일 거래: {len(today_trades)}건"
+        report += f"거래: {len(day_trades)}건"
 
         # 토큰 사용량
         token_usage = _load_token_usage()
-        today_usage = token_usage.get(today, {})
-        if today_usage:
-            report += f"\nAI 비용: ${today_usage['cost_usd']:.2f} ({today_usage['calls']}회 호출, 입력 {today_usage['input_tokens']:,} / 출력 {today_usage['output_tokens']:,} 토큰)"
+        day_usage = token_usage.get(report_date, {})
+        if day_usage:
+            report += f"\nAI 비용: ${day_usage['cost_usd']:.2f} ({day_usage['calls']}회 호출, 입력 {day_usage['input_tokens']:,} / 출력 {day_usage['output_tokens']:,} 토큰)"
 
         log.info(report)
         send_telegram(report)
