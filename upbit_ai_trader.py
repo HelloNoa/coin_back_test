@@ -473,18 +473,23 @@ def get_portfolio(upbit) -> dict:
             else:
                 coin_balances.append((currency, amount, float(b.get("avg_buy_price", 0))))
 
-    # 보유 코인 시세 일괄 조회 (API 1회)
+    # 보유 코인 시세 일괄 조회 (KRW 마켓에 존재하는 것만)
     prices = {}
     if coin_balances:
-        coin_tickers = [f"KRW-{c}" for c, _, _ in coin_balances]
         try:
-            result = pyupbit.get_current_price(coin_tickers)
-            if isinstance(result, dict):
-                prices = result
-            elif isinstance(result, (int, float)) and len(coin_tickers) == 1:
-                prices = {coin_tickers[0]: result}
-        except Exception as e:
-            log.warning(f"보유 코인 시세 일괄 조회 실패: {e}")
+            krw_markets = set(pyupbit.get_tickers(fiat="KRW"))
+        except Exception:
+            krw_markets = set()
+        coin_tickers = [f"KRW-{c}" for c, _, _ in coin_balances if f"KRW-{c}" in krw_markets]
+        if coin_tickers:
+            try:
+                result = pyupbit.get_current_price(coin_tickers)
+                if isinstance(result, dict):
+                    prices = result
+                elif isinstance(result, (int, float)) and len(coin_tickers) == 1:
+                    prices = {coin_tickers[0]: result}
+            except Exception as e:
+                log.warning(f"보유 코인 시세 일괄 조회 실패: {e}")
 
     for currency, amount, avg_price in coin_balances:
         ticker = f"KRW-{currency}"
