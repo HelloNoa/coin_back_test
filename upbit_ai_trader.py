@@ -18,13 +18,12 @@
 """
 
 import os
-import sys
 import time
 import json
 import signal
 import logging
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
@@ -44,6 +43,7 @@ TRADE_INTERVAL_SECONDS = 60 * 30   # 30분마다 판단
 RETRY_INTERVAL_SECONDS = 60        # 오류 시 1분 후 재시도
 MAX_COINS_TO_ANALYZE = 10          # 분석할 코인 수 (거래량 상위)
 INVEST_RATIO = 0.3                 # 1회 최대 투자 비율
+MAX_INVEST_KRW = 500_000           # 1회 최대 투자 금액 (50만원)
 MAX_CONCENTRATION = 0.3            # 단일 코인 최대 비중 (30%)
 MIN_ORDER_KRW = 6000               # 업비트 최소 주문금액
 STOP_LOSS_PCT = -15                # 손절 기준 (%)
@@ -51,7 +51,10 @@ TAKE_PROFIT_PCT = 30               # 익절 기준 (%)
 PRICE_ALERT_PCT = 5                # 급등/급락 감지 기준 (%)
 SPLIT_ORDER_COUNT = 3              # 분할 매매 횟수
 SPLIT_ORDER_DELAY = 5              # 분할 주문 간 대기 (초)
+MIN_SPLIT_KRW = 100_000            # 이 금액 이상일 때만 분할 매매
+ALERT_COOLDOWN_SECONDS = 60 * 5    # 급변동 감지 후 최소 5분 대기
 TRADE_HISTORY_FILE = "trade_history.json"
+TOKEN_USAGE_FILE = "token_usage.json"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -110,24 +113,57 @@ def save_trade_record(record: dict):
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 
+def _load_token_usage() -> dict:
+    try:
+        with open(TOKEN_USAGE_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_token_usage(input_tok: int, output_tok: int, cost: float):
+    usage = _load_token_usage()
+    today = datetime.now().strftime('%Y-%m-%d')
+    if today not in usage:
+        usage[today] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "calls": 0}
+    usage[today]["input_tokens"] += input_tok
+    usage[today]["output_tokens"] += output_tok
+    usage[today]["cost_usd"] += cost
+    usage[today]["calls"] += 1
+    # 30일 이상 된 데이터 정리
+    cutoff = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+    usage = {k: v for k, v in usage.items() if k >= cutoff}
+    with open(TOKEN_USAGE_FILE, "w") as f:
+        json.dump(usage, f, indent=2)
+
+
 def evaluate_past_decisions() -> str:
     """과거 매매 판단의 정확도를 현재 가격과 비교하여 요약"""
     history = load_trade_history()
     if not history:
         return "없음"
 
-    evaluations = []
-    for record in history[-10:]:
-        ticker = record.get("ticker", "")
-        action = record.get("action", "")
-        trade_price = record.get("trade_price", 0)
-        if not ticker or not trade_price or action == "hold":
-            continue
+    # 평가 대상 티커를 모아서 한 번에 시세 조회
+    recent = [r for r in history[-10:] if r.get("ticker") and r.get("trade_price") and r.get("action") != "hold"]
+    tickers_to_check = list({r["ticker"] for r in recent})
+    prices = {}
+    if tickers_to_check:
         try:
-            current_price = pyupbit.get_current_price(ticker)
-            if not current_price:
-                continue
+            price_result = pyupbit.get_current_price(tickers_to_check)
+            if isinstance(price_result, dict):
+                prices = price_result
+            elif isinstance(price_result, (int, float)) and len(tickers_to_check) == 1:
+                prices = {tickers_to_check[0]: price_result}
         except Exception:
+            pass
+
+    evaluations = []
+    for record in recent:
+        ticker = record["ticker"]
+        action = record["action"]
+        trade_price = record["trade_price"]
+        current_price = prices.get(ticker)
+        if not current_price:
             continue
         change_pct = round((current_price / trade_price - 1) * 100, 2)
         correct = (action == "buy" and change_pct > 0) or (action == "sell" and change_pct < 0)
@@ -351,18 +387,19 @@ def ask_claude_for_decision(
 - 손절: 보유 코인이 {STOP_LOSS_PCT}% 이하 손실이면 매도 적극 고려
 - 익절: 보유 코인이 +{TAKE_PROFIT_PCT}% 이상 수익이면 일부 매도 고려
 - 리스크 관리: 단일 거래에 전체 자산의 30% 이상 투자 금지
+- 1회 매수 금액 상한: {MAX_INVEST_KRW:,.0f}원 (이 금액을 초과하는 amount_krw는 자동으로 잘림)
 
 현재 시각: {datetime.now().strftime('%Y-%m-%d %H:%M')}
 시장 심리: {market_summary}
 
 포트폴리오:
-{json.dumps(portfolio, ensure_ascii=False, indent=2)}
+{json.dumps(portfolio, ensure_ascii=False, separators=(',', ':'))}
 
 기술적 지표 (상위 거래량 코인):
-{json.dumps(indicators_list, ensure_ascii=False, indent=2)}
+{json.dumps(indicators_list, ensure_ascii=False, separators=(',', ':'))}
 
 최근 거래 이력 (참고용):
-{json.dumps(recent_history, ensure_ascii=False, indent=2) if recent_history else "없음"}
+{json.dumps(recent_history, ensure_ascii=False, separators=(',', ':')) if recent_history else "없음"}
 
 과거 판단 정확도 (판단 시점 가격 → 현재 가격, ✓=정확 ✗=오판):
 {evaluate_past_decisions()}
@@ -373,10 +410,10 @@ def ask_claude_for_decision(
 
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     result = subprocess.run(
-        ["claude", "-p", prompt, "--output-format", "text", "--model", "sonnet"],
+        ["claude", "-p", prompt, "--output-format", "json", "--model", "sonnet"],
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=180,
         env=env,
     )
 
@@ -384,7 +421,21 @@ def ask_claude_for_decision(
         error_msg = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(f"claude CLI 오류 (code={result.returncode}): {error_msg}")
 
-    raw = result.stdout.strip()
+    try:
+        response = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        log.error(f"Claude CLI 응답 파싱 실패: {result.stdout[:300]}")
+        return []
+
+    # 토큰 사용량 추적
+    usage = response.get("usage", {})
+    input_tok = usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
+    output_tok = usage.get("output_tokens", 0)
+    cost = response.get("total_cost_usd", 0)
+    _save_token_usage(input_tok, output_tok, cost)
+    log.info(f"[토큰] 입력 {input_tok:,} / 출력 {output_tok:,} / ${cost:.4f}")
+
+    raw = response.get("result", "").strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
     try:
         decision = json.loads(raw)
@@ -412,6 +463,7 @@ def get_portfolio(upbit) -> dict:
             else:
                 raise
     portfolio = {}
+    coin_balances = []
     for b in balances:
         currency = b["currency"]
         amount = float(b["balance"])
@@ -419,19 +471,33 @@ def get_portfolio(upbit) -> dict:
             if currency == "KRW":
                 portfolio["KRW"] = round(amount, 0)
             else:
-                avg_price = float(b.get("avg_buy_price", 0))
-                try:
-                    current_price = pyupbit.get_current_price(f"KRW-{currency}") or 0
-                except Exception:
-                    log.warning(f"KRW-{currency} 시세 조회 실패, 건너뜀")
-                    continue
-                portfolio[f"KRW-{currency}"] = {
-                    "amount": amount,
-                    "avg_buy_price": avg_price,
-                    "current_price": current_price,
-                    "profit_pct": round((current_price / avg_price - 1) * 100, 2) if avg_price > 0 else 0,
-                    "value_krw": round(amount * current_price, 0),
-                }
+                coin_balances.append((currency, amount, float(b.get("avg_buy_price", 0))))
+
+    # 보유 코인 시세 일괄 조회 (API 1회)
+    prices = {}
+    if coin_balances:
+        coin_tickers = [f"KRW-{c}" for c, _, _ in coin_balances]
+        try:
+            result = pyupbit.get_current_price(coin_tickers)
+            if isinstance(result, dict):
+                prices = result
+            elif isinstance(result, (int, float)) and len(coin_tickers) == 1:
+                prices = {coin_tickers[0]: result}
+        except Exception as e:
+            log.warning(f"보유 코인 시세 일괄 조회 실패: {e}")
+
+    for currency, amount, avg_price in coin_balances:
+        ticker = f"KRW-{currency}"
+        current_price = prices.get(ticker, 0)
+        if not current_price:
+            continue
+        portfolio[ticker] = {
+            "amount": amount,
+            "avg_buy_price": avg_price,
+            "current_price": current_price,
+            "profit_pct": round((current_price / avg_price - 1) * 100, 2) if avg_price > 0 else 0,
+            "value_krw": round(amount * current_price, 0),
+        }
     return portfolio
 
 
@@ -441,6 +507,7 @@ def get_portfolio(upbit) -> dict:
 def validate_decisions(decisions: list[dict], portfolio: dict, valid_tickers: set) -> list[dict]:
     """AI 응답을 검증하여 유효한 결정만 반환"""
     validated = []
+    seen_tickers = set()
     for d in decisions:
         action = d.get("action", "")
         ticker = d.get("ticker", "")
@@ -452,6 +519,11 @@ def validate_decisions(decisions: list[dict], portfolio: dict, valid_tickers: se
 
         if action == "hold":
             validated.append(d)
+            continue
+
+        # 같은 코인 중복 판단 방지
+        if action in ("buy", "sell") and ticker in seen_tickers:
+            log.warning(f"[검증 실패] {ticker} 중복 판단 무시")
             continue
 
         # 티커 검증
@@ -479,6 +551,8 @@ def validate_decisions(decisions: list[dict], portfolio: dict, valid_tickers: se
                 continue
 
         validated.append(d)
+        if action in ("buy", "sell"):
+            seen_tickers.add(ticker)
 
     return validated
 
@@ -513,7 +587,8 @@ def check_concentration(ticker: str, buy_amount_krw: float, portfolio: dict) -> 
 # ──────────────────────────────────────────────
 # 매매 실행
 # ──────────────────────────────────────────────
-def execute_trade(upbit, decision: dict, portfolio: dict):
+def execute_trade(upbit, decision: dict, portfolio: dict) -> bool:
+    """매매 실행. 실제 체결되면 True, 취소/실패면 False 반환."""
     action = decision.get("action", "hold")
     ticker = decision.get("ticker", "")
     reason = decision.get("reason", "")
@@ -522,17 +597,17 @@ def execute_trade(upbit, decision: dict, portfolio: dict):
         krw_balance = portfolio.get("KRW", 0)
         amount_krw = float(decision.get("amount_krw", 0))
         max_invest = krw_balance * INVEST_RATIO
-        amount_krw = min(amount_krw, max_invest)
+        amount_krw = min(amount_krw, max_invest, MAX_INVEST_KRW)
 
         if not check_concentration(ticker, amount_krw, portfolio):
-            return
+            return False
 
         if amount_krw < MIN_ORDER_KRW:
             log.warning(f"[BUY 취소] 주문금액 {amount_krw:,.0f}원이 최소금액 미달")
-            return
+            return False
 
         # 분할 매수
-        split_count = SPLIT_ORDER_COUNT if amount_krw >= MIN_ORDER_KRW * SPLIT_ORDER_COUNT else 1
+        split_count = SPLIT_ORDER_COUNT if amount_krw >= MIN_SPLIT_KRW else 1
         split_amount = round(amount_krw / split_count, 0)
         log.info(f"[BUY] {ticker} 총 {amount_krw:,.0f}원 ({split_count}회 분할) | 이유: {reason}")
 
@@ -550,6 +625,7 @@ def execute_trade(upbit, decision: dict, portfolio: dict):
                     total_fee += float(order.get("paid_fee", 0))
             else:
                 log.warning(f"[BUY {i+1}/{split_count} 실패] {result}")
+                break
             if i < split_count - 1:
                 time.sleep(SPLIT_ORDER_DELAY)
 
@@ -557,24 +633,26 @@ def execute_trade(upbit, decision: dict, portfolio: dict):
             avg_price = round(amount_krw / total_filled_qty, 0) if total_filled_qty else 0
             log.info(f"[BUY 완료] {ticker} {total_filled_qty:.6f}개 @ 평균 {avg_price:,.0f}원 | 수수료: {total_fee:,.0f}원")
             send_telegram(f"🟢 *매수 체결* | {ticker}\n{total_filled_qty:.6f}개 @ {avg_price:,.0f}원 ({split_count}회 분할)\n수수료: {total_fee:,.0f}원\n사유: {reason}")
+            return True
         else:
             send_telegram(f"⚠️ *매수 실패* | {ticker}\n{amount_krw:,.0f}원")
+            return False
 
     elif action == "sell":
         sell_ratio = float(decision.get("sell_ratio", 1.0))
         coin_info = portfolio.get(ticker)
         if not coin_info:
             log.warning(f"[SELL 취소] {ticker} 보유량 없음")
-            return
+            return False
 
         sell_amount = coin_info["amount"] * sell_ratio
         if sell_amount * coin_info["current_price"] < MIN_ORDER_KRW:
             log.warning(f"[SELL 취소] 매도 금액이 최소금액 미달")
-            return
+            return False
 
         pnl = coin_info["profit_pct"]
         sell_krw_est = sell_amount * coin_info["current_price"]
-        split_count = SPLIT_ORDER_COUNT if sell_krw_est >= MIN_ORDER_KRW * SPLIT_ORDER_COUNT else 1
+        split_count = SPLIT_ORDER_COUNT if sell_krw_est >= MIN_SPLIT_KRW else 1
         split_qty = sell_amount / split_count
         log.info(f"[SELL] {ticker} {sell_ratio*100:.0f}% ({sell_amount:.6f}개, {split_count}회 분할) | 이유: {reason}")
 
@@ -592,14 +670,19 @@ def execute_trade(upbit, decision: dict, portfolio: dict):
                     total_fee += float(order.get("paid_fee", 0))
             else:
                 log.warning(f"[SELL {i+1}/{split_count} 실패] {result}")
+                break
             if i < split_count - 1:
                 time.sleep(SPLIT_ORDER_DELAY)
 
         if total_filled_krw > 0:
             log.info(f"[SELL 완료] {ticker} {total_filled_krw:,.0f}원 | 손익: {pnl:+.1f}% | 수수료: {total_fee:,.0f}원")
             send_telegram(f"🔴 *매도 체결* | {ticker}\n금액: {total_filled_krw:,.0f}원 ({split_count}회 분할)\n손익: {pnl:+.1f}% | 수수료: {total_fee:,.0f}원\n사유: {reason}")
+            return True
         else:
             send_telegram(f"⚠️ *매도 실패* | {ticker}")
+            return False
+
+    return False
 
 
 # ──────────────────────────────────────────────
@@ -702,19 +785,22 @@ def main():
                     summary_lines.append(f"⏸ {ticker}: {reason}")
                     continue
 
-                execute_trade(upbit, decision, portfolio)
-                summary_lines.append(f"{'🟢 BUY' if action == 'buy' else '🔴 SELL'} {ticker}: {reason}")
-                # 체결가 기록 (정확도 추적용)
-                trade_price = 0
-                try:
-                    trade_price = pyupbit.get_current_price(ticker) or 0
-                except Exception:
-                    pass
-                save_trade_record({
-                    "time": datetime.now().strftime('%Y-%m-%d %H:%M'),
-                    "trade_price": trade_price,
-                    **decision,
-                })
+                executed = execute_trade(upbit, decision, portfolio)
+                if executed:
+                    summary_lines.append(f"{'🟢 BUY' if action == 'buy' else '🔴 SELL'} {ticker}: {reason}")
+                    # 체결된 거래만 이력에 기록 (정확도 추적용)
+                    trade_price = 0
+                    try:
+                        trade_price = pyupbit.get_current_price(ticker) or 0
+                    except Exception:
+                        pass
+                    save_trade_record({
+                        "time": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                        "trade_price": trade_price,
+                        **decision,
+                    })
+                else:
+                    summary_lines.append(f"⏭ {ticker} 취소: {reason}")
 
             # 사이클 판단 요약 텔레그램 전송
             if summary_lines:
@@ -730,7 +816,8 @@ def main():
 
         log.info(f"다음 분석까지 {TRADE_INTERVAL_SECONDS//60}분 대기 (급변동 감지 중)...\n")
         if not wait_with_alert(upbit, portfolio):
-            log.info("급변동 감지! 즉시 사이클 재실행")
+            log.info(f"급변동 감지! {ALERT_COOLDOWN_SECONDS}초 쿨다운 후 사이클 재실행")
+            time.sleep(ALERT_COOLDOWN_SECONDS)
 
     # 종료 처리
     log.info("=" * 50)
@@ -746,13 +833,15 @@ def wait_with_alert(upbit, portfolio: dict) -> bool:
     if "KRW-BTC" not in watch_tickers:
         watch_tickers.append("KRW-BTC")
 
-    # 기준 가격 저장
+    # 기준 가격 저장 (일괄 조회)
     base_prices = {}
-    for t in watch_tickers:
+    if watch_tickers:
         try:
-            price = pyupbit.get_current_price(t)
-            if price:
-                base_prices[t] = price
+            result = pyupbit.get_current_price(watch_tickers)
+            if isinstance(result, dict):
+                base_prices = {t: p for t, p in result.items() if p}
+            elif isinstance(result, (int, float)) and len(watch_tickers) == 1:
+                base_prices = {watch_tickers[0]: result}
         except Exception:
             pass
 
@@ -771,20 +860,24 @@ def wait_with_alert(upbit, portfolio: dict) -> bool:
         time.sleep(check_interval)
         elapsed += check_interval
 
-        # 급변동 체크
-        for t, base_price in base_prices.items():
-            try:
-                current = pyupbit.get_current_price(t)
-                if not current:
-                    continue
-                change_pct = (current / base_price - 1) * 100
-                if abs(change_pct) >= PRICE_ALERT_PCT:
-                    direction = "급등" if change_pct > 0 else "급락"
-                    log.warning(f"[{direction}] {t} {change_pct:+.1f}% ({base_price:,.0f} → {current:,.0f})")
-                    send_telegram(f"⚡ *{direction} 감지* | {t}\n변동: {change_pct:+.1f}%\n{base_price:,.0f} → {current:,.0f}원")
-                    return False
-            except Exception:
-                pass
+        # 급변동 체크 (일괄 조회)
+        try:
+            current_prices = pyupbit.get_current_price(list(base_prices.keys()))
+            if isinstance(current_prices, (int, float)) and len(base_prices) == 1:
+                current_prices = {list(base_prices.keys())[0]: current_prices}
+            if isinstance(current_prices, dict):
+                for t, base_price in base_prices.items():
+                    current = current_prices.get(t)
+                    if not current:
+                        continue
+                    change_pct = (current / base_price - 1) * 100
+                    if abs(change_pct) >= PRICE_ALERT_PCT:
+                        direction = "급등" if change_pct > 0 else "급락"
+                        log.warning(f"[{direction}] {t} {change_pct:+.1f}% ({base_price:,.0f} → {current:,.0f})")
+                        send_telegram(f"⚡ *{direction} 감지* | {t}\n변동: {change_pct:+.1f}%\n{base_price:,.0f} → {current:,.0f}원")
+                        return False
+        except Exception:
+            pass
 
         # 일일 성과 리포트 (자정 직후 1회)
         now_date = datetime.now().strftime('%Y-%m-%d')
@@ -818,6 +911,12 @@ def send_daily_report(upbit):
         if holdings_text:
             report += "보유:\n" + "\n".join(holdings_text) + "\n"
         report += f"당일 거래: {len(today_trades)}건"
+
+        # 토큰 사용량
+        token_usage = _load_token_usage()
+        today_usage = token_usage.get(today, {})
+        if today_usage:
+            report += f"\nAI 비용: ${today_usage['cost_usd']:.2f} ({today_usage['calls']}회 호출, 입력 {today_usage['input_tokens']:,} / 출력 {today_usage['output_tokens']:,} 토큰)"
 
         log.info(report)
         send_telegram(report)
