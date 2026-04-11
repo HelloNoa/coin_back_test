@@ -40,7 +40,7 @@ import requests
 UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY", "YOUR_ACCESS_KEY")
 UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "YOUR_SECRET_KEY")
 
-TRADE_INTERVAL_SECONDS = 60 * 30   # 30분마다 판단
+TRADE_INTERVAL_SECONDS = 60 * 60   # 1시간마다 판단
 RETRY_INTERVAL_SECONDS = 60        # 오류 시 1분 후 재시도
 MAX_COINS_TO_ANALYZE = 10          # 분석할 코인 수 (거래량 상위)
 INVEST_RATIO = 0.3                 # 1회 최대 투자 비율
@@ -56,6 +56,7 @@ MIN_SPLIT_KRW = 100_000            # 이 금액 이상일 때만 분할 매매
 ALERT_COOLDOWN_SECONDS = 60 * 5    # 급변동 감지 후 최소 5분 대기
 TRADE_HISTORY_FILE = "trade_history.json"
 TOKEN_USAGE_FILE = "token_usage.json"
+LAST_REPORT_FILE = "last_report.txt"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -346,19 +347,7 @@ def get_market_summary() -> str:
 # ──────────────────────────────────────────────
 # AI 판단 요청 (Claude Code CLI 사용)
 # ──────────────────────────────────────────────
-def ask_claude_for_decision(
-    indicators_list: list[dict],
-    portfolio: dict,
-    market_summary: str,
-) -> dict:
-    """
-    Claude Code CLI를 subprocess로 호출하여 매매 결정을 JSON 배열로 받음.
-    반환: list[dict] — 각 항목은 buy/sell/hold 액션
-    """
-    trade_history = load_trade_history()
-    recent_history = trade_history[-10:] if trade_history else []
-
-    prompt = f"""당신은 암호화폐 퀀트 트레이더입니다.
+_SYSTEM_PROMPT = f"""당신은 암호화폐 퀀트 트레이더입니다.
 주어진 기술적 지표, 포트폴리오 현황, 시장 심리 데이터를 분석하여
 최적의 매매 결정을 내려야 합니다.
 
@@ -391,7 +380,25 @@ def ask_claude_for_decision(
 - 1회 매수 금액 상한: {MAX_INVEST_KRW:,.0f}원 (이 금액을 초과하는 amount_krw는 자동으로 잘림)
 - 매도 가능 여부: 포트폴리오 항목의 sellable=false인 코인은 보유량이 최소주문금액({MIN_ORDER_KRW:,}원) 미달이므로 절대 sell 결정을 내리지 마세요 (hold만 가능)
 
-현재 시각: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+참고: 각 코인의 orderbook 항목에서 buy_pressure > 1이면 매수 우세, < 1이면 매도 우세입니다.
+
+입력으로 시장 심리, 포트폴리오, 기술적 지표, 최근 거래 이력, 과거 판단 정확도가 주어집니다.
+이를 종합하여 최적의 매매 결정을 JSON 배열로만 응답하세요."""
+
+
+def ask_claude_for_decision(
+    indicators_list: list[dict],
+    portfolio: dict,
+    market_summary: str,
+) -> dict:
+    """
+    Claude Code CLI를 subprocess로 호출하여 매매 결정을 JSON 배열로 받음.
+    반환: list[dict] — 각 항목은 buy/sell/hold 액션
+    """
+    trade_history = load_trade_history()
+    recent_history = trade_history[-10:] if trade_history else []
+
+    user_prompt = f"""현재 시각: {datetime.now().strftime('%Y-%m-%d %H:%M')}
 시장 심리: {market_summary}
 
 포트폴리오:
@@ -404,15 +411,14 @@ def ask_claude_for_decision(
 {json.dumps(recent_history, ensure_ascii=False, separators=(',', ':')) if recent_history else "없음"}
 
 과거 판단 정확도 (판단 시점 가격 → 현재 가격, ✓=정확 ✗=오판):
-{evaluate_past_decisions()}
-
-참고: 각 코인의 orderbook 항목에서 buy_pressure > 1이면 매수 우세, < 1이면 매도 우세입니다.
-
-위 데이터를 종합하여 최적의 매매 결정을 JSON 배열로만 응답하세요."""
+{evaluate_past_decisions()}"""
 
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     result = subprocess.run(
-        ["claude", "-p", prompt, "--output-format", "json", "--model", "sonnet"],
+        ["claude", "-p", user_prompt, "--output-format", "json", "--model", "sonnet",
+         "--tools", "", "--effort", "low",
+         "--system-prompt", _SYSTEM_PROMPT,
+         "--exclude-dynamic-system-prompt-sections"],
         capture_output=True,
         text=True,
         timeout=180,
@@ -601,8 +607,9 @@ def check_concentration(ticker: str, buy_amount_krw: float, portfolio: dict) -> 
 # ──────────────────────────────────────────────
 # 매매 실행
 # ──────────────────────────────────────────────
-def _place_order_with_retry(order_func, *args, max_retries: int = 3) -> dict | None:
-    """주문 실행. 네트워크 에러 등으로 실패 시 재시도. 성공한 dict 응답 반환, 끝까지 실패 시 None."""
+def _place_order_with_retry(order_func, *args, max_retries: int = 5) -> dict | None:
+    """주문 실행. 네트워크 에러 등으로 실패 시 지수 백오프 재시도. 성공한 dict 응답 반환, 끝까지 실패 시 None."""
+    backoff = [2, 5, 10, 20, 30]  # 누적 67초까지 대기
     for attempt in range(max_retries):
         try:
             result = order_func(*args)
@@ -612,7 +619,9 @@ def _place_order_with_retry(order_func, *args, max_retries: int = 3) -> dict | N
         except Exception as e:
             log.warning(f"[주문 재시도 {attempt+1}/{max_retries}] 예외: {e}")
         if attempt < max_retries - 1:
-            time.sleep(2)
+            wait_sec = backoff[attempt] if attempt < len(backoff) else backoff[-1]
+            if _shutdown_event.wait(wait_sec):
+                return None
     return None
 
 
@@ -742,6 +751,7 @@ def main():
     while not _shutdown_requested:
         try:
             log.info("─── 분석 사이클 시작 ───")
+            _maybe_send_daily_report(upbit)
 
             # 1. 거래량 상위 코인 목록 수집 (전체 시세 API 1회 호출)
             all_tickers = pyupbit.get_tickers(fiat="KRW")
@@ -888,7 +898,6 @@ def wait_with_alert(upbit, portfolio: dict) -> bool:
 
     elapsed = 0
     check_interval = 60  # 1분마다 체크
-    last_report_date = datetime.now().strftime('%Y-%m-%d')
 
     while elapsed < TRADE_INTERVAL_SECONDS:
         if _shutdown_event.wait(check_interval):
@@ -914,13 +923,29 @@ def wait_with_alert(upbit, portfolio: dict) -> bool:
         except Exception:
             pass
 
-        # 일일 성과 리포트 (자정 직후 1회)
-        now_date = datetime.now().strftime('%Y-%m-%d')
-        if now_date != last_report_date and datetime.now().hour == 0:
-            last_report_date = now_date
-            send_daily_report(upbit)
+        # 일일 성과 리포트 (날짜 바뀌면 1회)
+        _maybe_send_daily_report(upbit)
 
     return True
+
+
+def _maybe_send_daily_report(upbit):
+    """오늘 아직 리포트를 안 보냈으면 발송. 마지막 발송 날짜를 파일에 영속화."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    last_sent = ""
+    try:
+        with open(LAST_REPORT_FILE, "r") as f:
+            last_sent = f.read().strip()
+    except FileNotFoundError:
+        pass
+    if last_sent == today:
+        return
+    send_daily_report(upbit)
+    try:
+        with open(LAST_REPORT_FILE, "w") as f:
+            f.write(today)
+    except Exception as e:
+        log.warning(f"리포트 발송일 저장 실패: {e}")
 
 
 def send_daily_report(upbit):
