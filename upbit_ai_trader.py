@@ -56,6 +56,7 @@ SPLIT_ORDER_COUNT = 3              # 분할 매매 횟수
 SPLIT_ORDER_DELAY = 5              # 분할 주문 간 대기 (초)
 MIN_SPLIT_KRW = 100_000            # 이 금액 이상일 때만 분할 매매
 ALERT_COOLDOWN_SECONDS = 60 * 5    # 급변동 감지 후 최소 5분 대기
+CLAUDE_MODEL = "sonnet"            # AI 판단 모델 (sonnet, haiku, opus 또는 전체 모델명)
 TRADE_HISTORY_FILE = "trade_history.json"
 TOKEN_USAGE_FILE = "token_usage.json"
 LAST_REPORT_FILE = "last_report.txt"
@@ -349,22 +350,47 @@ def get_market_summary() -> str:
 # ──────────────────────────────────────────────
 # AI 판단 요청 (Claude Code CLI 사용)
 # ──────────────────────────────────────────────
+_DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decisions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
+                    "ticker": {"type": "string"},
+                    "amount_krw": {"type": "number"},
+                    "sell_ratio": {"type": "number"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["action", "ticker", "reason"],
+            },
+        }
+    },
+    "required": ["decisions"],
+}
+
+
 _SYSTEM_PROMPT = f"""당신은 암호화폐 퀀트 트레이더입니다.
 주어진 기술적 지표, 포트폴리오 현황, 시장 심리 데이터를 분석하여
 최적의 매매 결정을 내려야 합니다.
 
-반드시 아래 JSON 배열 형식으로만 응답하세요 (다른 텍스트 없이, 마크다운 없이).
-여러 코인에 대해 동시에 판단할 수 있습니다. 아무 행동도 필요 없으면 빈 배열 []을 반환하세요.
+반드시 아래 JSON 객체 형식으로만 응답하세요.
+**중요: 응답은 오직 JSON 객체만 포함해야 합니다. 설명, 판단 근거 해설, 마크다운, 주석 등 어떤 추가 텍스트도 절대 포함하지 마세요.** 판단 근거는 각 결정 객체의 "reason" 필드에만 한 문장으로 작성하세요.
+여러 코인에 대해 동시에 판단할 수 있습니다. 아무 행동도 필요 없으면 decisions를 빈 배열 []로 반환하세요.
 
-[
-  {{
-    "action": "buy" 또는 "sell" 또는 "hold",
-    "ticker": "KRW-XXX",
-    "amount_krw": 숫자 (매수 시),
-    "sell_ratio": 0~1 사이 숫자 (매도 시),
-    "reason": "한 문장 판단 근거"
-  }}
-]
+{{
+  "decisions": [
+    {{
+      "action": "buy" 또는 "sell" 또는 "hold",
+      "ticker": "KRW-XXX",
+      "amount_krw": 숫자 (매수 시),
+      "sell_ratio": 0~1 사이 숫자 (매도 시),
+      "reason": "한 문장 판단 근거"
+    }}
+  ]
+}}
 
 판단 기준:
 - RSI < 30: 과매도 (매수 고려), RSI > 70: 과매수 (매도 고려)
@@ -388,7 +414,8 @@ _SYSTEM_PROMPT = f"""당신은 암호화폐 퀀트 트레이더입니다.
 참고: 각 코인의 orderbook 항목에서 buy_pressure > 1이면 매수 우세, < 1이면 매도 우세입니다.
 
 입력으로 시장 심리, 포트폴리오, 기술적 지표, 최근 거래 이력, 과거 판단 정확도가 주어집니다.
-이를 종합하여 최적의 매매 결정을 JSON 배열로만 응답하세요."""
+이를 종합하여 최적의 매매 결정을 JSON 객체({{"decisions": [...]}})로만 응답하세요.
+다시 강조: 응답에는 JSON 객체 외 어떤 텍스트도 포함하지 마세요. 해설, 설명, 판단 과정 모두 금지."""
 
 
 def ask_claude_for_decision(
@@ -434,7 +461,7 @@ def ask_claude_for_decision(
 
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     result = subprocess.run(
-        ["claude", "-p", user_prompt, "--output-format", "json", "--model", "sonnet",
+        ["claude", "-p", user_prompt, "--output-format", "json", "--model", CLAUDE_MODEL,
          "--tools", "", "--effort", "low",
          "--system-prompt", _SYSTEM_PROMPT,
          "--exclude-dynamic-system-prompt-sections"],
@@ -459,20 +486,37 @@ def ask_claude_for_decision(
     input_tok = usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
     output_tok = usage.get("output_tokens", 0)
     cost = response.get("total_cost_usd", 0)
+    num_turns = response.get("num_turns", 1)
     _save_token_usage(input_tok, output_tok, cost)
-    log.info(f"[토큰] 입력 {input_tok:,} / 출력 {output_tok:,} / ${cost:.4f}")
+    log.info(f"[토큰] 입력 {input_tok:,} / 출력 {output_tok:,} / ${cost:.4f} / turns={num_turns}")
+
+    # 출력 토큰이 비정상적으로 큰데 result가 짧으면 디버그 덤프
+    raw_result = response.get("result", "")
 
     raw = response.get("result", "").strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
+    # JSON 시작 위치 찾기 ('[' 또는 '{')
+    json_start = -1
+    for i, ch in enumerate(raw):
+        if ch in "[{":
+            json_start = i
+            break
+    if json_start == -1:
+        log.error(f"AI 응답에 JSON 없음: {raw[:300]}")
+        return []
     try:
-        decision = json.loads(raw)
+        # raw_decode는 첫 JSON만 파싱하고 뒤 텍스트는 무시
+        parsed, _ = json.JSONDecoder().raw_decode(raw[json_start:])
     except json.JSONDecodeError:
         log.error(f"AI 응답 JSON 파싱 실패: {raw[:300]}")
         return []
-    # 단일 dict면 배열로 감싸기 (하위 호환)
-    if isinstance(decision, dict):
-        decision = [decision]
-    return decision
+    # 스키마: {"decisions": [...]} 형태에서 배열 추출
+    if isinstance(parsed, dict):
+        if "decisions" in parsed:
+            return parsed["decisions"]
+        # 단일 dict (하위 호환)
+        return [parsed]
+    return parsed
 
 
 # ──────────────────────────────────────────────
