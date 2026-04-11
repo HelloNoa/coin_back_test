@@ -46,6 +46,8 @@ MAX_COINS_TO_ANALYZE = 10          # 분석할 코인 수 (거래량 상위)
 INVEST_RATIO = 0.3                 # 1회 최대 투자 비율
 MAX_INVEST_KRW = 500_000           # 1회 최대 투자 금액 (50만원)
 MAX_CONCENTRATION = 0.3            # 단일 코인 최대 비중 (30%)
+MAX_POSITIONS = 5                  # 보유 코인 최대 개수 (sellable만 카운트)
+MIN_KRW_RESERVE = 50_000           # 매수 후 남아야 할 최소 KRW 잔고
 MIN_ORDER_KRW = 6000               # 업비트 최소 주문금액
 STOP_LOSS_PCT = -15                # 손절 기준 (%)
 TAKE_PROFIT_PCT = 30               # 익절 기준 (%)
@@ -379,6 +381,9 @@ _SYSTEM_PROMPT = f"""당신은 암호화폐 퀀트 트레이더입니다.
 - 리스크 관리: 단일 거래에 전체 자산의 30% 이상 투자 금지
 - 1회 매수 금액 상한: {MAX_INVEST_KRW:,.0f}원 (이 금액을 초과하는 amount_krw는 자동으로 잘림)
 - 매도 가능 여부: 포트폴리오 항목의 sellable=false인 코인은 보유량이 최소주문금액({MIN_ORDER_KRW:,}원) 미달이므로 절대 sell 결정을 내리지 마세요 (hold만 가능)
+- 포지션 한도: sellable=true 코인을 최대 {MAX_POSITIONS}개까지 보유 가능. 한도 도달 시 신규 매수 전 기존 부진 코인을 먼저 매도해야 함
+- KRW 최저 잔고: 매수 후에도 KRW 잔고가 {MIN_KRW_RESERVE:,}원 이상 남아야 함
+- 포지션 정리 우선순위: 손실 깊은 코인 > 모멘텀 약한 코인 > 익절 수익 코인 순으로 매도 고려
 
 참고: 각 코인의 orderbook 항목에서 buy_pressure > 1이면 매수 우세, < 1이면 매도 우세입니다.
 
@@ -398,8 +403,22 @@ def ask_claude_for_decision(
     trade_history = load_trade_history()
     recent_history = trade_history[-10:] if trade_history else []
 
+    sellable_count = sum(1 for t, info in portfolio.items()
+                         if t != "KRW" and isinstance(info, dict) and info.get("sellable"))
+    krw_balance = portfolio.get("KRW", 0)
+    status_lines = [
+        f"보유 포지션: {sellable_count}/{MAX_POSITIONS}"
+        + (" (한도 도달 — 신규 매수 전 기존 코인 정리 필요)" if sellable_count >= MAX_POSITIONS else ""),
+        f"KRW 잔고: {krw_balance:,.0f}원"
+        + (f" (최저 잔고 {MIN_KRW_RESERVE:,}원 미달 — 신규 매수 전 정리 필요)" if krw_balance < MIN_KRW_RESERVE else ""),
+    ]
+    status_text = "\n".join(status_lines)
+
     user_prompt = f"""현재 시각: {datetime.now().strftime('%Y-%m-%d %H:%M')}
 시장 심리: {market_summary}
+
+상태:
+{status_text}
 
 포트폴리오:
 {json.dumps(portfolio, ensure_ascii=False, separators=(',', ':'))}
@@ -638,6 +657,18 @@ def execute_trade(upbit, decision: dict, portfolio: dict) -> bool:
         amount_krw = min(amount_krw, max_invest, MAX_INVEST_KRW)
 
         if not check_concentration(ticker, amount_krw, portfolio):
+            return False
+
+        # 보유 포지션 수 한도 (신규 진입만 차단, 기존 코인 추가 매수는 허용)
+        sellable_count = sum(1 for t, info in portfolio.items()
+                             if t != "KRW" and isinstance(info, dict) and info.get("sellable"))
+        if ticker not in portfolio and sellable_count >= MAX_POSITIONS:
+            log.warning(f"[BUY 취소] 보유 포지션 한도 초과 ({sellable_count}/{MAX_POSITIONS})")
+            return False
+
+        # KRW 최저 잔고 보호
+        if krw_balance - amount_krw < MIN_KRW_RESERVE:
+            log.warning(f"[BUY 취소] 매수 후 KRW 잔고 {krw_balance - amount_krw:,.0f}원이 최저 잔고 {MIN_KRW_RESERVE:,}원 미달")
             return False
 
         if amount_krw < MIN_ORDER_KRW:
