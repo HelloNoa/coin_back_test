@@ -57,9 +57,14 @@ SPLIT_ORDER_DELAY = 5              # 분할 주문 간 대기 (초)
 MIN_SPLIT_KRW = 100_000            # 이 금액 이상일 때만 분할 매매
 ALERT_COOLDOWN_SECONDS = 60 * 5    # 급변동 감지 후 최소 5분 대기
 CLAUDE_MODEL = "sonnet"            # AI 판단 모델 (sonnet, haiku, opus 또는 전체 모델명)
+TRADE_COOLDOWN_HOURS = 2           # 같은 코인 매매 후 N시간 쿨다운
+TRAILING_STOP_PCT = -10            # 피크 대비 -N% 빠지면 트레일링 손절 신호
+ERROR_ALERT_INTERVAL = 60 * 30     # 에러 텔레그램 알림 최소 간격 (30분)
+STABLECOINS = {"KRW-USDT", "KRW-USDC", "KRW-DAI", "KRW-TUSD"}
 TRADE_HISTORY_FILE = "trade_history.json"
 TOKEN_USAGE_FILE = "token_usage.json"
 LAST_REPORT_FILE = "last_report.txt"
+PEAKS_FILE = "position_peaks.json"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -140,6 +145,54 @@ def _save_token_usage(input_tok: int, output_tok: int, cost: float):
     usage = {k: v for k, v in usage.items() if k >= cutoff}
     with open(TOKEN_USAGE_FILE, "w") as f:
         json.dump(usage, f, indent=2)
+
+
+def _load_peaks() -> dict:
+    try:
+        with open(PEAKS_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_peaks(peaks: dict):
+    try:
+        with open(PEAKS_FILE, "w") as f:
+            json.dump(peaks, f, indent=2)
+    except Exception as e:
+        log.warning(f"peak 저장 실패: {e}")
+
+
+def update_peaks(portfolio: dict) -> dict:
+    """보유 코인의 peak 가격 업데이트. 미보유 코인은 제거. 갱신된 peaks dict 반환."""
+    peaks = _load_peaks()
+    active_tickers = {
+        t for t, info in portfolio.items()
+        if t != "KRW" and isinstance(info, dict) and info.get("current_price", 0) > 0
+    }
+    peaks = {t: v for t, v in peaks.items() if t in active_tickers}
+    for t in active_tickers:
+        current = portfolio[t]["current_price"]
+        if current > peaks.get(t, 0):
+            peaks[t] = current
+    _save_peaks(peaks)
+    return peaks
+
+
+def _is_in_cooldown(ticker: str) -> bool:
+    """최근 TRADE_COOLDOWN_HOURS 시간 내 같은 티커 거래가 있으면 True."""
+    history = load_trade_history()
+    cutoff = datetime.now() - timedelta(hours=TRADE_COOLDOWN_HOURS)
+    for record in reversed(history):
+        if record.get("ticker") != ticker:
+            continue
+        try:
+            t = datetime.strptime(record.get("time", ""), "%Y-%m-%d %H:%M")
+            if t >= cutoff:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def evaluate_past_decisions() -> str:
@@ -410,6 +463,8 @@ _SYSTEM_PROMPT = f"""당신은 암호화폐 퀀트 트레이더입니다.
 - 포지션 한도: sellable=true 코인을 최대 {MAX_POSITIONS}개까지 보유 가능. 한도 도달 시 신규 매수 전 기존 부진 코인을 먼저 매도해야 함
 - KRW 최저 잔고: 매수 후에도 KRW 잔고가 {MIN_KRW_RESERVE:,}원 이상 남아야 함
 - 포지션 정리 우선순위: 손실 깊은 코인 > 모멘텀 약한 코인 > 익절 수익 코인 순으로 매도 고려
+- 트레일링 스톱: 보유 코인의 drawdown_from_peak_pct가 {TRAILING_STOP_PCT}% 이하면 (peak 대비 {abs(TRAILING_STOP_PCT)}% 이상 하락) 적극 매도 고려 — 수익을 토해내지 마세요
+- 매매 쿨다운: 최근 {TRADE_COOLDOWN_HOURS}시간 내 거래한 코인은 다시 매매 금지 (왕복 거래 방지)
 
 참고: 각 코인의 orderbook 항목에서 buy_pressure > 1이면 매수 우세, < 1이면 매도 우세입니다.
 
@@ -695,6 +750,9 @@ def execute_trade(upbit, decision: dict, portfolio: dict) -> bool:
     reason = decision.get("reason", "")
 
     if action == "buy":
+        if _is_in_cooldown(ticker):
+            log.warning(f"[BUY 취소] {ticker} 최근 {TRADE_COOLDOWN_HOURS}시간 내 거래 — 쿨다운 차단")
+            return False
         krw_balance = portfolio.get("KRW", 0)
         amount_krw = float(decision.get("amount_krw", 0))
         max_invest = krw_balance * INVEST_RATIO
@@ -752,6 +810,9 @@ def execute_trade(upbit, decision: dict, portfolio: dict) -> bool:
             return False
 
     elif action == "sell":
+        if _is_in_cooldown(ticker):
+            log.warning(f"[SELL 취소] {ticker} 최근 {TRADE_COOLDOWN_HOURS}시간 내 거래 — 쿨다운 차단")
+            return False
         sell_ratio = float(decision.get("sell_ratio", 1.0))
         coin_info = portfolio.get(ticker)
         if not coin_info:
@@ -803,6 +864,7 @@ def execute_trade(upbit, decision: dict, portfolio: dict) -> bool:
 # ──────────────────────────────────────────────
 _shutdown_requested = False
 _shutdown_event = threading.Event()
+_last_error_alert_ts = 0.0
 
 
 def _signal_handler(sig, frame):
@@ -853,11 +915,19 @@ def main():
                     if (i + 1) % 10 == 0:
                         time.sleep(0.5)
                 volumes.sort(key=lambda x: x[1], reverse=True)
-            top_tickers = [v[0] for v in volumes[:MAX_COINS_TO_ANALYZE]]
+            top_tickers = [v[0] for v in volumes if v[0] not in STABLECOINS][:MAX_COINS_TO_ANALYZE]
 
-            # 2. 포트폴리오 조회
+            # 2. 포트폴리오 조회 + peak 가격 업데이트
             time.sleep(1)
             portfolio = get_portfolio(upbit)
+            peaks = update_peaks(portfolio)
+            for t, info in portfolio.items():
+                if t == "KRW" or not isinstance(info, dict):
+                    continue
+                peak = peaks.get(t, info.get("current_price", 0))
+                info["peak_price"] = round(peak, 2)
+                if peak > 0:
+                    info["drawdown_from_peak_pct"] = round((info["current_price"] / peak - 1) * 100, 2)
             log.info(f"현재 포트폴리오: {portfolio}")
 
             # 매도 가능한 보유 코인만 분석 대상에 포함 (dust 제외)
@@ -929,6 +999,10 @@ def main():
 
         except Exception as e:
             log.error(f"사이클 오류: {e}", exc_info=True)
+            global _last_error_alert_ts
+            if time.time() - _last_error_alert_ts > ERROR_ALERT_INTERVAL:
+                send_telegram(f"⚠️ *사이클 오류*\n{type(e).__name__}: {str(e)[:200]}")
+                _last_error_alert_ts = time.time()
             log.info(f"오류 발생, {RETRY_INTERVAL_SECONDS}초 후 재시도...")
             if _shutdown_event.wait(RETRY_INTERVAL_SECONDS):
                 break
