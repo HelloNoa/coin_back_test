@@ -991,11 +991,18 @@ def main():
                 else:
                     summary_lines.append(f"⏭ {ticker} 취소: {reason}")
 
-            # 사이클 판단 요약 텔레그램 전송
+            # 사이클 판단 요약 + 총 자산 텔레그램 전송
+            now = datetime.now().strftime('%H:%M')
+            total_value = portfolio.get("KRW", 0)
+            for t, info in portfolio.items():
+                if t != "KRW" and isinstance(info, dict):
+                    total_value += info.get("value_krw", 0)
+            asset_line = f"💰 총 자산: {total_value:,.0f}원 (현금 {portfolio.get('KRW', 0):,.0f}원)"
             if summary_lines:
-                now = datetime.now().strftime('%H:%M')
-                summary = f"📋 *사이클 요약* ({now})\n" + "\n".join(summary_lines)
-                send_telegram(summary)
+                summary = f"📋 *사이클 요약* ({now})\n" + "\n".join(summary_lines) + f"\n{asset_line}"
+            else:
+                summary = f"📋 *사이클 요약* ({now})\n판단: 홀드\n{asset_line}"
+            send_telegram(summary)
 
         except Exception as e:
             log.error(f"사이클 오류: {e}", exc_info=True)
@@ -1089,16 +1096,16 @@ def _maybe_send_daily_report(upbit):
         pass
     if last_sent == today:
         return
-    send_daily_report(upbit)
-    try:
-        with open(LAST_REPORT_FILE, "w") as f:
-            f.write(today)
-    except Exception as e:
-        log.warning(f"리포트 발송일 저장 실패: {e}")
+    if send_daily_report(upbit):
+        try:
+            with open(LAST_REPORT_FILE, "w") as f:
+                f.write(today)
+        except Exception as e:
+            log.warning(f"리포트 발송일 저장 실패: {e}")
 
 
-def send_daily_report(upbit):
-    """일일 거래 요약 + 총 자산 현황을 텔레그램으로 전송"""
+def send_daily_report(upbit) -> bool:
+    """일일 거래 요약 + 총 자산 현황을 텔레그램으로 전송. 성공 시 True."""
     try:
         portfolio = get_portfolio(upbit)
         total_value = portfolio.get("KRW", 0)
@@ -1129,8 +1136,10 @@ def send_daily_report(upbit):
 
         log.info(report)
         send_telegram(report)
+        return True
     except Exception as e:
         log.warning(f"일일 리포트 생성 실패: {e}")
+        return False
 
 
 if __name__ == "__main__":
